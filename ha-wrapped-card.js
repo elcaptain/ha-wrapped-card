@@ -10,7 +10,7 @@
  * Needs an admin user (registry + recorder websocket commands).
  */
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 console.info(`%c HA-WRAPPED-CARD %c v${VERSION} `, "color:#1d2126;background:#18bcf2;font-weight:700", "color:#18bcf2;background:#1d2126");
 
 const HELPER_DOMAINS = new Set([
