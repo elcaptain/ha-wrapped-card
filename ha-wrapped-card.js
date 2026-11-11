@@ -32,7 +32,7 @@ const CACHE_MS = 6 * 60 * 60 * 1000; // re-gather at most every 6 hours
 
 /* ------------------------------------------------------------------ data -- */
 
-async function collectWrapped(hass, year) {
+async function collectWrapped(hass, year, onCore) {
   const tz = hass.config?.time_zone || Intl.DateTimeFormat().resolvedOptions().timeZone;
   const start = new Date(year, 0, 1);
   const end = new Date(year + 1, 0, 1);
@@ -45,14 +45,18 @@ async function collectWrapped(hass, year) {
     return { hour: +g("hour"), weekday: g("weekday"), month: +g("month") - 1, day: +g("day") };
   };
 
+  // Ask for the list of sensor statistics right away; it's only needed for the
+  // slow energy and climate sheets, which load after the rest.
+  const statIdsReq = hass.callWS({ type: "recorder/list_statistic_ids" })
+    .catch((e) => { console.warn("ha-wrapped: statistics unavailable", e); return []; });
+
   // Everything that doesn't depend on something else goes out in one round trip.
-  const [entries, devices, entities, areas, manifests, statIdsAll] = await Promise.all([
+  const [entries, devices, entities, areas, manifests] = await Promise.all([
     hass.callWS({ type: "config_entries/get" }),
     hass.callWS({ type: "config/device_registry/list" }),
     hass.callWS({ type: "config/entity_registry/list" }),
     hass.callWS({ type: "config/area_registry/list" }),
     hass.callWS({ type: "manifest/list" }).catch(() => []), // loaded integrations' names
-    hass.callWS({ type: "recorder/list_statistic_ids" }).catch((e) => { console.warn("ha-wrapped: statistics unavailable", e); return []; }),
   ]);
   const entryById = Object.fromEntries(entries.map((e) => [e.entry_id, e]));
   const areaName = Object.fromEntries(areas.map((a) => [a.area_id, a.name]));
@@ -120,88 +124,93 @@ async function collectWrapped(hass, year) {
     return dev?.name_by_user || dev?.name || hass.states[id]?.attributes?.friendly_name || id;
   };
 
-  let energy = null;
-  let climate = null;
-  try {
-    const statIds = statIdsAll;
-    const sensorStat = (s) => s.statistic_id.startsWith("sensor.");
-    const energyIds = statIds.filter((s) => sensorStat(s) && s.has_sum && s.unit_class === "energy"
-      && !/returned|export|production|solar|feed_in/i.test(s.statistic_id));
-    const tempIds = statIds.filter((s) => sensorStat(s) && s.has_mean && s.unit_class === "temperature"
-      && !/nozzle|bed_temp|cpu|chip|wash|water|forecast|feeling|dew|_target|setpoint/i.test(s.statistic_id));
+  // A year of sensor statistics is the slow part. It runs on its own so the
+  // slides that don't need it can be shown first.
+  const statsPromise = (async () => {
+    let energy = null;
+    let climate = null;
+    try {
+      const statIds = await statIdsReq;
+      const sensorStat = (s) => s.statistic_id.startsWith("sensor.");
+      const energyIds = statIds.filter((s) => sensorStat(s) && s.has_sum && s.unit_class === "energy"
+        && !/returned|export|production|solar|feed_in/i.test(s.statistic_id));
+      const tempIds = statIds.filter((s) => sensorStat(s) && s.has_mean && s.unit_class === "temperature"
+        && !/nozzle|bed_temp|cpu|chip|wash|water|forecast|feeling|dew|_target|setpoint/i.test(s.statistic_id));
 
-    const period = (ids, types) => ids.length ? hass.callWS({
-      type: "recorder/statistics_during_period",
-      start_time: start.toISOString(), end_time: end.toISOString(),
-      statistic_ids: ids.map((s) => s.statistic_id), period: "month", types,
-    }) : {};
-    const [eStats, tStats] = await Promise.all([
-      period(energyIds, ["change"]),
-      period(tempIds, ["mean", "min", "max"]),
-    ]);
+      const period = (ids, types) => ids.length ? hass.callWS({
+        type: "recorder/statistics_during_period",
+        start_time: start.toISOString(), end_time: end.toISOString(),
+        statistic_ids: ids.map((s) => s.statistic_id), period: "month", types,
+      }) : {};
+      const [eStats, tStats] = await Promise.all([
+        period(energyIds, ["change"]),
+        period(tempIds, ["mean", "min", "max"]),
+      ]);
 
-    // Energy: one total per device (devices often expose several energy sensors)
-    const perDevice = new Map();
-    const monthly = Array(12).fill(0);
-    for (const [id, rows] of Object.entries(eStats)) {
-      const unit = energyIds.find((s) => s.statistic_id === id)?.statistics_unit_of_measurement;
-      const k = unit === "Wh" ? 0.001 : unit === "MWh" ? 1000 : 1;
-      const months = Array(12).fill(0);
-      rows.forEach((r) => { months[new Date(r.start).getMonth()] += Math.max(0, r.change || 0) * k; });
-      const total = months.reduce((a, b) => a + b, 0);
-      const devKey = entityById[id]?.device_id || id;
-      const prev = perDevice.get(devKey);
-      if (!prev || total > prev.total) perDevice.set(devKey, { id, total, months });
-    }
-    const consumers = [...perDevice.values()].filter((c) => c.total > 0.01).sort((a, b) => b.total - a.total);
-    if (consumers.length) {
-      consumers.forEach((c) => c.months.forEach((v, i) => { monthly[i] += v; }));
-      energy = {
-        total: consumers.reduce((a, c) => a + c.total, 0),
-        top: consumers.slice(0, 4).map((c) => ({ name: friendly(c.id), kwh: c.total })),
-        monthly,
-        peakMonth: monthly.indexOf(Math.max(...monthly)),
-        count: consumers.length,
-      };
-    }
-
-    // Climate: indoor rooms vs outside
-    const rooms = [];
-    let outside = null;
-    for (const [id, rows] of Object.entries(tStats)) {
-      if (!rows.length) continue;
-      const max = Math.max(...rows.map((r) => r.max ?? -Infinity));
-      const min = Math.min(...rows.map((r) => r.min ?? Infinity));
-      const mean = rows.reduce((a, r) => a + (r.mean ?? 0), 0) / rows.length;
-      const platform = entityById[id]?.platform;
-      const isOutside = WEATHER_PLATFORMS.has(platform) || /outside|outdoor|exterior/i.test(id);
-      if (isOutside) {
-        if (!outside || max > outside.max) {
-          const hot = rows.reduce((a, r) => (r.max > a.max ? r : a));
-          outside = { max, min, month: new Date(hot.start).getMonth() };
-        }
-        continue;
+      // Energy: one total per device (devices often expose several energy sensors)
+      const perDevice = new Map();
+      const monthly = Array(12).fill(0);
+      for (const [id, rows] of Object.entries(eStats)) {
+        const unit = energyIds.find((s) => s.statistic_id === id)?.statistics_unit_of_measurement;
+        const k = unit === "Wh" ? 0.001 : unit === "MWh" ? 1000 : 1;
+        const months = Array(12).fill(0);
+        rows.forEach((r) => { months[new Date(r.start).getMonth()] += Math.max(0, r.change || 0) * k; });
+        const total = months.reduce((a, b) => a + b, 0);
+        const devKey = entityById[id]?.device_id || id;
+        const prev = perDevice.get(devKey);
+        if (!prev || total > prev.total) perDevice.set(devKey, { id, total, months });
       }
-      const room = areaOfEntity(id);
-      if (room) rooms.push({ room, max, min, mean });
+      const consumers = [...perDevice.values()].filter((c) => c.total > 0.01).sort((a, b) => b.total - a.total);
+      if (consumers.length) {
+        consumers.forEach((c) => c.months.forEach((v, i) => { monthly[i] += v; }));
+        energy = {
+          total: consumers.reduce((a, c) => a + c.total, 0),
+          top: consumers.slice(0, 4).map((c) => ({ name: friendly(c.id), kwh: c.total })),
+          monthly,
+          peakMonth: monthly.indexOf(Math.max(...monthly)),
+          count: consumers.length,
+        };
+      }
+
+      // Climate: indoor rooms vs outside
+      const rooms = [];
+      let outside = null;
+      for (const [id, rows] of Object.entries(tStats)) {
+        if (!rows.length) continue;
+        const max = Math.max(...rows.map((r) => r.max ?? -Infinity));
+        const min = Math.min(...rows.map((r) => r.min ?? Infinity));
+        const mean = rows.reduce((a, r) => a + (r.mean ?? 0), 0) / rows.length;
+        const platform = entityById[id]?.platform;
+        const isOutside = WEATHER_PLATFORMS.has(platform) || /outside|outdoor|exterior/i.test(id);
+        if (isOutside) {
+          if (!outside || max > outside.max) {
+            const hot = rows.reduce((a, r) => (r.max > a.max ? r : a));
+            outside = { max, min, month: new Date(hot.start).getMonth() };
+          }
+          continue;
+        }
+        const room = areaOfEntity(id);
+        if (room) rooms.push({ room, max, min, mean });
+      }
+      // Keep the warmest sensor per room
+      const byRoom = new Map();
+      rooms.forEach((r) => { if (!byRoom.has(r.room) || r.mean > byRoom.get(r.room).mean) byRoom.set(r.room, r); });
+      const roomList = [...byRoom.values()].sort((a, b) => b.mean - a.mean);
+      if (roomList.length || outside) {
+        climate = {
+          rooms: roomList,
+          hottest: [...roomList].sort((a, b) => b.max - a.max)[0],
+          // Coolest = lowest average, so a single cold spike doesn't win
+          coldest: roomList.at(-1),
+          outside,
+          unit: hass.config?.unit_system?.temperature || "°C",
+        };
+      }
+    } catch (err) {
+      console.warn("ha-wrapped: statistics unavailable", err);
     }
-    // Keep the warmest sensor per room
-    const byRoom = new Map();
-    rooms.forEach((r) => { if (!byRoom.has(r.room) || r.mean > byRoom.get(r.room).mean) byRoom.set(r.room, r); });
-    const roomList = [...byRoom.values()].sort((a, b) => b.mean - a.mean);
-    if (roomList.length || outside) {
-      climate = {
-        rooms: roomList,
-        hottest: [...roomList].sort((a, b) => b.max - a.max)[0],
-        // Coolest = lowest average, so a single cold spike doesn't win
-        coldest: roomList.at(-1),
-        outside,
-        unit: hass.config?.unit_system?.temperature || "°C",
-      };
-    }
-  } catch (err) {
-    console.warn("ha-wrapped: statistics unavailable", err);
-  }
+    return { energy, climate };
+  })();
 
   // ---- home today
   const states = Object.keys(hass.states);
@@ -226,7 +235,7 @@ async function collectWrapped(hass, year) {
     { score: now.automations * 0.8, name: "The Automator", emoji: "🤖", line: "Why press a button when your house can do it?" },
   ].sort((a, b) => b.score - a.score);
 
-  return {
+  const core = {
     year, tz,
     integrations: {
       count: integrationsNew.length,
@@ -254,9 +263,12 @@ async function collectWrapped(hass, year) {
       byMonth, peakMonth: byMonth.indexOf(Math.max(...byMonth)),
       topDay: byDay[0]?.[0], peakHour, byHour,
     },
-    energy, climate, now,
+    energy: null, climate: null, statsPending: true, now,
     archetype: archetypes[0],
   };
+  onCore?.(core);
+  const stats = await statsPromise;
+  return { ...core, ...stats, statsPending: false };
 }
 
 /* -------------------------------------------------------------- helpers -- */
@@ -400,6 +412,25 @@ function introSlide(year, loading = false) {
   };
 }
 
+// Stands in for the energy and climate sheets until the statistics arrive.
+function readingsSlide(year) {
+  return {
+    key: "READINGS",
+    ghost: "SCAN",
+    html: `
+      <div class="row">${tag("07 / READINGS")}${glyph("wave")}</div>
+      <p class="lead">Reading a year of sensor history</p>
+      <div class="scan" aria-hidden="true"><i></i></div>
+      ${spec([
+        ["SOURCE", "RECORDER · LONG-TERM STATS"],
+        ["RANGE", `01.01 — 31.12.${year}`],
+        ["STATUS", '<span class="blink">ACQUIRING…</span>', true],
+      ])}
+      <p class="mono sm dim">ENERGY + CLIMATE SHEETS SLOT IN HERE WHEN READY</p>
+      <div class="hint mono">TAP TO CONTINUE →</div>`,
+  };
+}
+
 function buildSlides(w) {
   const s = [];
   const tz = w.tz;
@@ -524,6 +555,8 @@ function buildSlides(w) {
         ${ticks(hours, hours.map((_, i) => (i % 6 === 0 ? pad(i) : "")), { caption: "SETUPS / HOUR OF DAY", titles: hours.map((_, i) => fmtHour(i)) })}`,
     });
   }
+
+  if (w.statsPending) s.push(readingsSlide(w.year));
 
   if (w.energy) {
     const e = w.energy;
@@ -803,6 +836,16 @@ const STORY_CSS = `
 .seal i { position: absolute; inset: 9%; border: 1px dashed rgba(24,188,242,.45); border-radius: 50%; }
 .body > .barcode { width: 100%; height: 22px; opacity: .8; }
 
+/* pending readings */
+.scan { position: relative; height: 15cqh; border: 1px solid var(--hair); overflow: hidden;
+  background: repeating-linear-gradient(90deg, rgba(242,244,249,.07) 0 1px, transparent 1px 8.33%),
+    repeating-linear-gradient(to top, rgba(242,244,249,.05) 0 1px, transparent 1px 25%); }
+.scan i { position: absolute; top: 0; bottom: 0; left: 0; width: 1px; background: var(--ha-blue);
+  box-shadow: 0 0 12px 2px rgba(24,188,242,.5); animation: sweep 1.8s cubic-bezier(.6,0,.4,1) infinite alternate; }
+.scan::after { content: ""; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(24,188,242,.08) 50%, transparent); animation: sweepGlow 1.8s ease-in-out infinite alternate; }
+.blink { animation: pulse 1.2s steps(2, jump-none) infinite; }
+
 /* summary sticker */
 .sticker { border: 1px solid var(--ha-white); background: rgba(29,33,38,.82); padding: 14px; display: flex; flex-direction: column; gap: 12px; }
 .st-hd { display: flex; align-items: center; gap: 10px; }
@@ -833,7 +876,10 @@ const STORY_CSS = `
 @keyframes grow { from { transform: scaleY(0) } }
 @keyframes growX { from { transform: scaleX(0) } }
 @keyframes pulse { 50% { opacity: .35 } }
-@media (prefers-reduced-motion: reduce) { .sheet, .slide, .body > *, .tk-plot i, .rank li, .rank .bar i, .pips i, .chips span, .cells div { animation: none !important; } }
+@keyframes sweep { to { left: calc(100% - 1px); } }
+@keyframes sweepGlow { from { transform: translateX(-50%); } to { transform: translateX(50%); } }
+@media (prefers-reduced-motion: reduce) { .sheet, .slide, .body > *, .tk-plot i, .rank li, .rank .bar i, .pips i, .chips span, .cells div,
+  .scan i, .scan::after { animation: none !important; } }
 `;
 
 class HaWrappedStory extends HTMLElement {
@@ -841,6 +887,7 @@ class HaWrappedStory extends HTMLElement {
     this.slides = slides;
     this.year = year;
     this.idx = 0;
+    this.final = false; // more slides may still arrive
     const root = this.shadowRoot || this.attachShadow({ mode: "open" });
     root.innerHTML = `<style>${STORY_CSS}</style>
       <div class="wrap"><div class="stage">
@@ -861,27 +908,39 @@ class HaWrappedStory extends HTMLElement {
     window.addEventListener("keydown", this._key);
     this.show();
   }
-  // Swap in the full deck once data arrives, without re-animating the intro.
-  setSlides(slides) {
+  // Swap in a newer deck while the viewer is browsing. Slides arrive in two
+  // steps (the quick ones, then energy and climate), so keep the viewer on the
+  // same slide by its key and only redraw it when its content changed.
+  setSlides(slides, final = true) {
+    const cur = this.slides[this.idx];
     this.slides = slides;
+    this.final = final;
     this.shadowRoot.querySelector(".progress").innerHTML = slides.map(() => "<i></i>").join("");
-    const hint = this.holder.querySelector(".hint");
-    if (hint) hint.textContent = "TAP TO BEGIN →";
-    const no = this.holder.querySelector(".sheetno");
-    if (no) no.textContent = this.sheetNo();
-    this.updateProgress();
-    // A tap that came in while loading moves on as soon as the deck is ready
+    let i = slides.findIndex((x) => x.key === cur.key);
+    // The slide on screen was a stand-in that's now gone: show what replaced it
+    const replaced = i < 0;
+    if (replaced) i = Math.min(this.idx, slides.length - 1);
+    this.idx = i;
+    if (replaced || (cur.key !== "INTRO" && slides[i].html !== cur.html)) {
+      this.show();
+    } else {
+      const hint = this.holder.querySelector(".hint");
+      if (hint && cur.key === "INTRO") hint.textContent = "TAP TO BEGIN →";
+      const no = this.holder.querySelector(".sheetno");
+      if (no) no.textContent = this.sheetNo();
+      this.updateProgress();
+    }
+    // A tap past the end that came in while loading moves on now
     if (this._wantNext) { this._wantNext = false; this.go(this.idx + 1); }
   }
   // Slides only change on tap, click or arrow key; there is no auto-advance.
   go(i) {
     if (i < 0) i = 0;
-    if (i >= this.slides.length) { this._wantNext = this.loading; return; } // still loading, or on summary
+    if (i >= this.slides.length) { this._wantNext = !this.final; return; } // still loading, or on summary
     this.idx = i;
     this.show();
   }
-  get loading() { return this.slides.length === 1; }
-  sheetNo() { return this.loading ? `SHEET 01/··` : `SHEET ${pad(this.idx + 1)}/${pad(this.slides.length)}`; }
+  sheetNo() { return `SHEET ${pad(this.idx + 1)}/${this.final ? pad(this.slides.length) : "··"}`; }
   updateProgress() {
     this.shadowRoot.querySelectorAll(".progress i").forEach((el, i) => {
       el.className = i < this.idx ? "done" : i === this.idx ? "cur" : "";
@@ -942,23 +1001,29 @@ class HaWrappedCard extends HTMLElement {
   static getStubConfig() { return {}; }
 
   // Data is gathered once per browser and cached for a few hours, so only the
-  // very first run waits on the recorder.
+  // very first run waits on the recorder. It arrives in two steps: `_core`
+  // (registries, quick) and `_full` (plus a year of statistics, slow).
   prefetch() {
-    if (this._dataPromise) return this._dataPromise;
+    if (this._full) return this._full;
     const key = `ha-wrapped:v2:${this.year}`;
     try {
       const cached = JSON.parse(localStorage.getItem(key) || "null");
-      if (cached && Date.now() - cached.at < CACHE_MS) return (this._dataPromise = Promise.resolve(cached.data));
+      if (cached && Date.now() - cached.at < CACHE_MS) {
+        this._core = this._full = Promise.resolve(cached.data);
+        return this._full;
+      }
     } catch (_) { /* storage unavailable */ }
+    let coreReady;
+    this._core = new Promise((res) => { coreReady = res; });
     const idle = window.requestIdleCallback || ((cb) => setTimeout(cb, 300));
-    this._dataPromise = new Promise((res) => idle(res, { timeout: 2000 }))
-      .then(() => collectWrapped(this._hass, this.year))
+    this._full = new Promise((res) => idle(res, { timeout: 2000 }))
+      .then(() => collectWrapped(this._hass, this.year, coreReady))
       .then((data) => {
         try { localStorage.setItem(key, JSON.stringify({ at: Date.now(), data })); } catch (_) { /* full or blocked */ }
         return data;
       });
-    this._dataPromise.catch(() => { this._dataPromise = null; }); // allow retry
-    return this._dataPromise;
+    this._full.catch(() => { this._full = this._core = null; }); // allow retry
+    return this._full;
   }
 
   render() {
@@ -1005,8 +1070,14 @@ class HaWrappedCard extends HTMLElement {
     document.body.appendChild(story);
     story.open([introSlide(this.year, true)], this.year);
     try {
-      const data = await this.prefetch();
-      if (story.isConnected) story.setSlides(buildSlides(data));
+      const full = this.prefetch();
+      // Show the quick slides first; energy and climate slot in when ready
+      const core = await Promise.race([this._core, full]);
+      if (story.isConnected) story.setSlides(buildSlides(core), !core.statsPending);
+      if (core.statsPending) {
+        const data = await full;
+        if (story.isConnected) story.setSlides(buildSlides(data), true);
+      }
     } catch (e) {
       console.error("ha-wrapped", e);
       story.close();
