@@ -21,13 +21,27 @@ Slides without data are skipped. For example, the energy slide only appears if y
 
 ## Install
 
-1. Add `ha-wrapped-card.js` as a dashboard resource of type **module**. Either copy it to `/config/www/` and use the URL `/local/ha-wrapped-card.js`, or paste it as an inline resource.
-2. Add the card to a dashboard:
+### HACS / Marketplace (custom repository)
 
-   ```yaml
-   type: custom:ha-wrapped-card
-   year: 2026 # optional, defaults to the current year
-   ```
+1. Open **Settings** > **Marketplace** (or HACS on Home Assistant 2026.10 and older).
+2. Add `https://github.com/elcaptain/ha-wrapped-card` as a custom repository of type **Dashboard**.
+3. Install **Home Assistant Wrapped**. The dashboard resource is registered for you.
+4. Reload the browser.
+
+### Manual
+
+Download `ha-wrapped-card.js` from the [latest release](https://github.com/elcaptain/ha-wrapped-card/releases/latest), copy it to `/config/www/`, and add `/local/ha-wrapped-card.js` as a dashboard resource of type **module**.
+
+### Add the card
+
+Installing only adds the card; it doesn't create a dashboard. Add it to any dashboard through **Add card** > **Home Assistant Wrapped**, or in YAML:
+
+```yaml
+type: custom:ha-wrapped-card
+year: 2026 # optional, defaults to the current year
+```
+
+A **panel** view gives the card a full-width spot of its own.
 
 The card needs an **admin** user, because it reads the registries and recorder statistics over the websocket API.
 

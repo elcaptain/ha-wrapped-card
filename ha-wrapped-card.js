@@ -1,13 +1,17 @@
 /**
  * Home Assistant Wrapped — a year-in-review story for your smart home.
  *
- * Install: copy to /config/www/ha-wrapped-card.js, add as a dashboard resource
- * (/local/ha-wrapped-card.js, type: module), then add a card:
+ * Install through HACS / the Marketplace (custom repository), or copy to
+ * /config/www/ha-wrapped-card.js and add it as a dashboard resource
+ * (/local/ha-wrapped-card.js, type: module). Then add a card:
  *   type: custom:ha-wrapped-card
  *   year: 2026   # optional, defaults to the current year
  *
  * Needs an admin user (registry + recorder websocket commands).
  */
+
+const VERSION = "1.0.0";
+console.info(`%c HA-WRAPPED-CARD %c v${VERSION} `, "color:#fff;background:#7c3aed;font-weight:700", "color:#7c3aed;background:#fff");
 
 const HELPER_DOMAINS = new Set([
   "template", "group", "utility_meter", "switch_as_x", "derivative", "integration",
@@ -716,7 +720,7 @@ class HaWrappedCard extends HTMLElement {
 if (!customElements.get("ha-wrapped-card")) customElements.define("ha-wrapped-card", HaWrappedCard);
 
 window.customCards = window.customCards || [];
-window.customCards.push({ type: "ha-wrapped-card", name: "Home Assistant Wrapped", description: "Your year in smart home, Spotify Wrapped style." });
+window.customCards.push({ type: "ha-wrapped-card", name: "Home Assistant Wrapped", description: "A tap-through year-in-review story for your smart home." });
 
 // Exposed for previews/tests
 window.haWrapped = { collectWrapped, buildSlides };
