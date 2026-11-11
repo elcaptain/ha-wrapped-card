@@ -465,10 +465,8 @@ const STORY_CSS = `
 @media (min-width: 700px) { .stage { height: min(92vh, 860px); width: calc(min(92vh, 860px) * 9 / 16); border-radius: 24px; box-shadow: 0 30px 80px rgba(0,0,0,.6); } }
 .progress { position: absolute; top: 12px; left: 12px; right: 12px; display: flex; gap: 4px; z-index: 5; }
 .progress i { flex: 1; height: 3px; border-radius: 3px; background: rgba(255,255,255,.3); overflow: hidden; }
-.progress i b { display: block; height: 100%; width: 0; background: #fff; }
-.progress i.done b { width: 100%; }
-.progress i.cur b { animation: fill var(--dur) linear forwards; }
-.paused .progress i.cur b { animation-play-state: paused; }
+.progress i b { display: block; height: 100%; width: 0; background: #fff; transition: width .3s ease; }
+.progress i.done b, .progress i.cur b { width: 100%; }
 .close { position: absolute; top: 24px; right: 14px; z-index: 6; background: none; border: 0; color: #fff; font-size: 28px; cursor: pointer; opacity: .8; padding: 4px 8px; }
 .tapL, .tapR { position: absolute; top: 0; bottom: 0; z-index: 4; cursor: pointer; }
 .tapL { left: 0; width: 30%; } .tapR { right: 0; width: 70%; }
@@ -545,7 +543,6 @@ h2 { font-size: 36px; margin: 0; font-weight: 900; letter-spacing: -.02em; }
 .sum-grid b { font-size: 20px; font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .sum-foot { margin-top: 18px; font-size: 12px; opacity: .6; }
 
-@keyframes fill { from { width: 0 } to { width: 100% } }
 @keyframes fadeIn { from { opacity: 0 } }
 @keyframes slideIn { from { opacity: 0; transform: scale(1.04) } }
 @keyframes rise { from { opacity: 0; transform: translateY(18px) } }
@@ -559,7 +556,6 @@ class HaWrappedStory extends HTMLElement {
   open(slides) {
     this.slides = slides;
     this.idx = 0;
-    this.dur = 7000;
     const root = this.shadowRoot || this.attachShadow({ mode: "open" });
     root.innerHTML = `<style>${STORY_CSS}</style>
       <div class="wrap"><div class="stage">
@@ -568,14 +564,10 @@ class HaWrappedStory extends HTMLElement {
         <div class="holder"></div>
         <div class="tapL"></div><div class="tapR"></div>
       </div></div>`;
-    this.stage = root.querySelector(".stage");
     this.holder = root.querySelector(".holder");
     root.querySelector(".close").onclick = () => this.close();
     root.querySelector(".tapL").onclick = () => this.go(this.idx - 1);
     root.querySelector(".tapR").onclick = () => this.go(this.idx + 1);
-    const hold = (on) => () => { this.paused = on; this.stage.classList.toggle("paused", on); };
-    this.stage.addEventListener("pointerdown", (e) => { this._down = Date.now(); hold(true)(); });
-    this.stage.addEventListener("pointerup", hold(false));
     this._key = (e) => {
       if (e.key === "Escape") this.close();
       else if (e.key === "ArrowRight" || e.key === " ") this.go(this.idx + 1);
@@ -591,19 +583,20 @@ class HaWrappedStory extends HTMLElement {
     const hint = this.holder.querySelector(".hint");
     if (hint) hint.textContent = "Tap to begin →";
     this.updateProgress();
+    // A tap that came in while loading moves on as soon as the deck is ready
     if (this._wantNext) { this._wantNext = false; this.go(this.idx + 1); }
-    else this.startTimer(); // give the intro its full time now that it's tappable
   }
+  // Slides only change on tap, click or arrow key; there is no auto-advance.
   go(i) {
     if (i < 0) i = 0;
-    if (i >= this.slides.length) { this._wantNext = true; return; } // still loading, or on summary
+    if (i >= this.slides.length) { this._wantNext = this.loading; return; } // still loading, or on summary
     this.idx = i;
     this.show();
   }
+  get loading() { return this.slides.length === 1; }
   updateProgress() {
     this.shadowRoot.querySelectorAll(".progress i").forEach((el, i) => {
       el.className = i < this.idx ? "done" : i === this.idx ? "cur" : "";
-      el.style.setProperty("--dur", `${this.dur}ms`);
     });
   }
   show() {
@@ -611,19 +604,6 @@ class HaWrappedStory extends HTMLElement {
     this.holder.innerHTML = `<section class="slide t-${s.theme}">${s.html}</section>`;
     this.updateProgress();
     this.countUp();
-    this.startTimer();
-  }
-  startTimer() {
-    // Restart the bar animation too, so it stays in sync with the timer
-    const cur = this.shadowRoot.querySelector(".progress i.cur");
-    if (cur) { cur.className = ""; void cur.offsetWidth; cur.className = "cur"; }
-    clearInterval(this._timer);
-    let elapsed = 0;
-    this._timer = setInterval(() => {
-      if (this.paused) return;
-      elapsed += 100;
-      if (elapsed >= this.dur && this.idx < this.slides.length - 1) this.go(this.idx + 1);
-    }, 100);
   }
   countUp() {
     this.holder.querySelectorAll("[data-count]").forEach((el) => {
@@ -642,7 +622,6 @@ class HaWrappedStory extends HTMLElement {
     });
   }
   close() {
-    clearInterval(this._timer);
     window.removeEventListener("keydown", this._key);
     this.remove();
   }
