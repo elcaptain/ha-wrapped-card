@@ -721,6 +721,3 @@ if (!customElements.get("ha-wrapped-card")) customElements.define("ha-wrapped-ca
 
 window.customCards = window.customCards || [];
 window.customCards.push({ type: "ha-wrapped-card", name: "Home Assistant Wrapped", description: "A tap-through year-in-review story for your smart home." });
-
-// Exposed for previews/tests
-window.haWrapped = { collectWrapped, buildSlides };

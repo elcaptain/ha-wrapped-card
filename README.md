@@ -65,12 +65,6 @@ Data collection starts in the background when the dashboard loads. The result is
 - The energy totals cover only devices with energy sensors. Several sensors on one device are counted once.
 - The temperature stats use monthly min/max values, so a sensor that reads high, for example one heated by its own chip, can win "warmest room".
 
-## Development
+## License
 
-`preview.html` runs the card outside Home Assistant with a mock `hass` object and a snapshot of sample data:
-
-```bash
-python3 -m http.server 8765
-```
-
-Then open <http://localhost:8765/preview.html>. Add `#play` to the URL to open the story right away, or `?slow` to simulate a slow instance.
+[MIT](LICENSE)
