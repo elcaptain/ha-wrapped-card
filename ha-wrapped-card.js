@@ -252,7 +252,7 @@ async function collectWrapped(hass, year) {
       nightPct: events.length ? Math.round((night / events.length) * 100) : 0,
       weekendPct: events.length ? Math.round((weekend / events.length) * 100) : 0,
       byMonth, peakMonth: byMonth.indexOf(Math.max(...byMonth)),
-      topDay: byDay[0]?.[0], peakHour,
+      topDay: byDay[0]?.[0], peakHour, byHour,
     },
     energy, climate, now,
     archetype: archetypes[0],
@@ -261,65 +261,191 @@ async function collectWrapped(hass, year) {
 
 /* -------------------------------------------------------------- helpers -- */
 
-const fmtDate = (ts, tz) => new Date(ts * 1000).toLocaleDateString("en-US", { timeZone: tz, month: "long", day: "numeric" });
-const fmtHour = (h) => `${((h + 11) % 12) + 1} ${h < 12 ? "AM" : "PM"}`;
+const fmtDot = (ts, tz) => new Intl.DateTimeFormat("en-GB", { timeZone: tz, day: "2-digit", month: "2-digit" })
+  .format(new Date(ts * 1000)).replace("/", ".");
+const fmtHour = (h) => `${String(h).padStart(2, "0")}:00`;
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const num = (n, d = 0) => Number(n).toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d });
+const pad = (n, l = 2) => String(n).padStart(l, "0");
+const MON = ["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"];
+const MONTH3 = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
 
-function bars(values, labels, opts = {}) {
-  const max = Math.max(...values, 1);
-  const hi = opts.highlight ?? values.indexOf(max);
-  return `<div class="bars">${values.map((v, i) => `
-    <div class="bar ${i === hi ? "hi" : ""}" title="${esc(labels[i])}: ${num(v, opts.dp || 0)}">
-      <span style="--h:${Math.max(4, (v / max) * 100)}%;--i:${i}"></span>
-      <em>${esc(labels[i]).slice(0, opts.cut || 1)}</em>
-    </div>`).join("")}</div>`;
+// Tiny deterministic PRNG, so a slide's paper stack looks the same every time.
+function rng(seed) {
+  let s = (seed * 2654435761) >>> 0 || 1;
+  return () => ((s = (s * 1664525 + 1013904223) >>> 0) / 4294967296);
+}
+const hash = (text) => [...String(text)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) >>> 0, 7);
+
+/* ------------------------------------------------------- micro-graphics -- */
+
+// Line glyphs in the spirit of compliance marks on device labels.
+const GLYPHS = {
+  house: '<path d="M3 11.5 12 4l9 7.5V20H3z"/><path d="M15.5 6.5V3.5h2.5v5"/>',
+  cross: '<path d="M12 1v22M1 12h22"/><circle cx="12" cy="12" r="5"/>',
+  quad: '<circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 1 9 9h-9zM12 12v9a9 9 0 0 1-9-9z" fill="currentColor" stroke="none"/>',
+  sq2: '<rect x="3" y="3" width="18" height="18"/><rect x="8" y="8" width="8" height="8"/>',
+  bolt: '<path d="M12 2.5 22.5 20.5h-21z"/><path d="m13 9-2.5 4.5h3L11 18"/>',
+  ring: '<circle cx="8.5" cy="12" r="6"/><circle cx="15.5" cy="12" r="6"/>',
+  nodes: '<circle cx="5" cy="6" r="2.2"/><circle cx="19" cy="6" r="2.2"/><circle cx="12" cy="18.5" r="2.2"/><path d="M7.2 6h9.6M6.2 8l4.7 8.6M17.8 8l-4.7 8.6"/>',
+  thermo: '<path d="M10 4.5a2 2 0 0 1 4 0v9.7a4.2 4.2 0 1 1-4 0z"/><path d="M12 9v8.5"/>',
+  wave: '<path d="M1.5 12h3l2.2-6.5 3.3 13 3.2-10 2.3 6.5 1.8-3h5.2"/>',
+  wrench: '<path d="M14.5 3.5a5 5 0 0 0 6 6L10 20a2.1 2.1 0 0 1-3-3L17.5 6.5a5 5 0 0 0-3-3z"/>',
+  gear: '<circle cx="12" cy="12" r="3.5"/><circle cx="12" cy="12" r="8"/><path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3"/>',
+  moon: '<path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/>',
+  sun: '<circle cx="12" cy="12" r="4.5"/><path d="M12 1.5v3.5M12 19v3.5M1.5 12H5M19 12h3.5M4.6 4.6l2.4 2.4M17 17l2.4 2.4M4.6 19.4 7 17M17 7l2.4-2.4"/>',
+  plug: '<path d="M8 2v5M16 2v5M5 7h14v4a7 7 0 0 1-14 0zM12 18v4"/>',
+  grid: '<rect x="3" y="3" width="18" height="18"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/>',
+  person: '<circle cx="12" cy="7" r="3.5"/><path d="M4.5 21a7.5 7.5 0 0 1 15 0"/>',
+  bracket: '<path d="M8 3H4v18h4M16 3h4v18h-4"/><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none"/>',
+  checker: Array.from({ length: 16 }, (_, i) => ((i + Math.floor(i / 4)) % 2
+    ? "" : `<rect x="${3 + (i % 4) * 4.5}" y="${3 + Math.floor(i / 4) * 4.5}" width="4.5" height="4.5" fill="currentColor" stroke="none"/>`)).join(""),
+};
+const glyph = (k, cls = "") => `<svg class="g ${cls}" viewBox="0 0 24 24" aria-hidden="true">${GLYPHS[k] || ""}</svg>`;
+
+// A fake barcode, stable for a given text.
+function barcode(text, bars = 44) {
+  const r = rng(hash(text));
+  let x = 0;
+  let out = "";
+  for (let i = 0; i < bars; i++) {
+    const w = 1 + Math.floor(r() * 3);
+    if (i % 2 === 0) out += `<rect x="${x}" y="0" width="${w}" height="20"/>`;
+    x += w;
+  }
+  return `<svg class="barcode" viewBox="0 0 ${x} 20" preserveAspectRatio="none" aria-hidden="true">${out}</svg>`;
+}
+
+const tag = (text, cls = "") => `<span class="tag ${cls}">[ ${text} ]</span>`;
+
+// Key/value rows, like the INPUT/OUTPUT block on a power supply label.
+const spec = (rows) => `<dl class="spec">${rows.filter(Boolean).map(([k, v, hi]) =>
+  `<div${hi ? ' class="hi"' : ""}><dt>${esc(k)}</dt><dd>${v}</dd></div>`).join("")}</dl>`;
+
+// Proportion as a row of pips.
+const pips = (frac, n = 24) => `<div class="pips" aria-hidden="true">${Array.from({ length: n }, (_, i) =>
+  `<i class="${i < Math.round(frac * n) ? "on" : ""}" style="--i:${i}"></i>`).join("")}</div>`;
+
+// Thin-line histogram with an axis and a caption.
+function ticks(values, labels, opts = {}) {
+  const max = Math.max(...values, 0.0001);
+  const hi = values.indexOf(Math.max(...values));
+  return `<figure class="ticks">
+    <div class="tk-plot">${values.map((v, i) =>
+      `<i class="${i === hi ? "hi" : ""}" style="--h:${Math.max(1.5, (v / max) * 100)}%;--i:${i}" title="${esc(opts.titles?.[i] ?? labels[i])}: ${num(v, opts.dp || 0)}"></i>`).join("")}</div>
+    <div class="tk-axis">${labels.map((l, i) => `<span class="${i === hi ? "hi" : ""}">${l}</span>`).join("")}</div>
+    <figcaption><span>${esc(opts.caption || "")}</span><span>MAX ${num(max, opts.dp || 0)}${opts.unit || ""}</span></figcaption>
+  </figure>`;
+}
+
+// Min–max range with a mean marker, for room temperatures.
+function rangeRow(r, lo, hi) {
+  const p = (v) => Math.min(100, Math.max(0, ((v - lo) / (hi - lo)) * 100));
+  return `<div class="rng"><span class="rng-l">${esc(r.room)}</span>
+    <span class="rng-t"><i style="left:${p(r.min)}%;width:${p(r.max) - p(r.min)}%"></i><b style="left:${p(r.mean)}%"></b></span>
+    <span class="rng-v">${num(r.mean, 1)}°</span></div>`;
+}
+
+// Several sheets of drafting paper, slightly rotated and out of focus.
+function sheets(seed, ghost) {
+  const r = rng(seed + 11);
+  const layer = (i) => {
+    const rot = (r() * 5 - 2.5).toFixed(2);
+    const tx = (r() * 8 - 4).toFixed(1);
+    const ty = (r() * 6 - 3).toFixed(1);
+    const cx = (12 + r() * 66).toFixed(1);
+    const cy = (20 + r() * 120).toFixed(1);
+    const rad = (6 + r() * 16).toFixed(1);
+    const fy = (14 + r() * 120).toFixed(1);
+    const fx = (6 + r() * 40).toFixed(1);
+    const lines = Array.from({ length: 5 }, (_, k) =>
+      `<rect x="${fx}" y="${(+fy + 3 + k * 1.6).toFixed(1)}" width="${(8 + r() * 22).toFixed(1)}" height=".55"/>`).join("");
+    const dimY = (8 + r() * 140).toFixed(1);
+    const blue = i === 1 ? " blue" : "";
+    return `<div class="sheet s${i}${blue}" style="--rot:${rot}deg;--tx:${tx}%;--ty:${ty}%">
+      <svg viewBox="0 0 90 160" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+        <g class="ln">
+          <circle cx="${cx}" cy="${cy}" r="${rad}"/><circle cx="${cx}" cy="${cy}" r="${(rad / 2.4).toFixed(1)}"/>
+          <path d="M${cx - rad - 5} ${cy}h${rad * 2 + 10}M${cx} ${cy - rad - 5}v${rad * 2 + 10}"/>
+          <rect x="${fx}" y="${fy}" width="${(24 + r() * 26).toFixed(1)}" height="${(12 + r() * 22).toFixed(1)}"/>
+          <path d="M6 ${dimY}h78M6 ${dimY - 2}v4M84 ${dimY - 2}v4"/>
+          <path d="M4 4h5M4 4v5M86 4h-5M86 4v5M4 156h5M4 156v-5M86 156h-5M86 156v-5"/>
+        </g>
+        <g class="tx">${lines}</g>
+        ${i === 2 && ghost ? `<text class="ghost" x="-4" y="${(60 + r() * 60).toFixed(0)}">${esc(ghost)}</text>` : ""}
+      </svg>
+    </div>`;
+  };
+  return `<div class="sheets" aria-hidden="true">${[0, 1, 2].map(layer).join("")}</div>`;
 }
 
 /* --------------------------------------------------------------- slides -- */
 
 function introSlide(year, loading = false) {
   return {
-    theme: "intro",
+    key: "INTRO",
+    ghost: String(year),
     html: `
-      <div class="kicker">Home Assistant</div>
-      <h1 class="mega">Your<br>${year}<br><span class="grad">Wrapped</span></h1>
-      <p class="sub">A year of tinkering, automating and making your home a little smarter.</p>
-      <div class="hint">${loading ? "Gathering your year…" : "Tap to begin →"}</div>`,
+      <div class="row">${tag("YEAR IN REVIEW")}${tag(`REF.${year}`, "blue")}</div>
+      <p class="mono sm dim">HOME ASSISTANT — ANNUAL REPORT</p>
+      <h1 class="hero">Wrapped<span class="blue">.</span></h1>
+      <div class="yr"><span>${year}</span>${glyph("cross", "lg")}</div>
+      ${spec([
+        ["SUBJECT", "YOUR HOME"],
+        ["PERIOD", `01.01 — 31.12.${year}`],
+        ["FORMAT", "TAP-THROUGH · SHEETS"],
+      ])}
+      <div class="marks">${["house", "quad", "checker", "sq2", "ring", "bolt"].map((g) => glyph(g)).join("")}</div>
+      <div class="hint mono">${loading ? "GATHERING YOUR YEAR…" : "TAP TO BEGIN →"}</div>`,
   };
 }
 
 function buildSlides(w) {
   const s = [];
   const tz = w.tz;
+  const yy = String(w.year).slice(-2);
 
   s.push(introSlide(w.year));
 
   if (w.integrations.count) {
+    const i = w.integrations;
+    const peak = i.byMonth.indexOf(Math.max(...i.byMonth));
     s.push({
-      theme: "violet",
+      key: "INTEGRATIONS",
+      ghost: "INTEGRATIONS",
       html: `
-        <div class="kicker">Integrations</div>
-        <p class="lead">This year you connected</p>
-        <div class="big"><span data-count="${w.integrations.count}">0</span></div>
-        <p class="lead">integrations to your home</p>
-        <p class="sub">That's <b>${w.integrations.domains}</b> brand-new kinds of things Home Assistant learned to talk to${w.integrations.helpers ? `, plus <b>${w.integrations.helpers}</b> helpers you built yourself` : ""}.</p>
-        ${bars(w.integrations.byMonth, MONTHS)}
-        <p class="foot">Busiest month: <b>${MONTHS[w.integrations.byMonth.indexOf(Math.max(...w.integrations.byMonth))]}</b></p>`,
+        <div class="row">${tag("01 / INTEGRATIONS")}${glyph("plug")}</div>
+        <p class="lead">Connected this year</p>
+        <div class="big"><span data-count="${i.count}">0</span><sup>INT.</sup></div>
+        ${spec([
+          ["NEW KINDS", `${i.domains}`],
+          ["HELPERS BUILT", `${i.helpers}`],
+          ["BUSIEST MONTH", MONTH3[peak], true],
+        ])}
+        ${ticks(i.byMonth, MON, { caption: "ADDED / MONTH", titles: MONTH3 })}`,
     });
   }
 
   if (w.integrations.first) {
+    const f = w.integrations.first;
+    const l = w.integrations.latest;
+    const months = Math.max(0, Math.round((l.date - f.date) / (86400 * 30.4)));
     s.push({
-      theme: "teal",
+      key: "ORIGIN",
+      ghost: "ORIGIN",
       html: `
-        <div class="kicker">Where it started</div>
-        <p class="lead">On <b>${fmtDate(w.integrations.first.date, tz)}</b>, your first new integration was</p>
-        <div class="name">${esc(w.integrations.first.name)}</div>
-        <div class="divider"></div>
-        <p class="lead">And most recently, on ${fmtDate(w.integrations.latest.date, tz)}:</p>
-        <div class="name small">${esc(w.integrations.latest.name)}</div>
-        <p class="sub">${esc(w.integrations.latest.title)}</p>`,
+        <div class="row">${tag("02 / ORIGIN")}${glyph("bracket")}</div>
+        <div class="label">
+          <div class="label-hd"><span>FIRST ENTRY</span><span>${fmtDot(f.date, tz)}.${yy}</span></div>
+          <div class="name">${esc(f.name)}</div>
+          <div class="label-ft"><span class="mono sm dim">${esc(f.title)}</span>${barcode(f.name)}</div>
+        </div>
+        <div class="leader mono sm"><span></span>${months} MONTH${months === 1 ? "" : "S"} LATER<span></span></div>
+        <div class="label hi">
+          <div class="label-hd"><span>LATEST ENTRY</span><span>${fmtDot(l.date, tz)}.${yy}</span></div>
+          <div class="name sm">${esc(l.name)}</div>
+          <div class="label-ft"><span class="mono sm dim">${esc(l.title)}</span>${barcode(l.name)}</div>
+        </div>`,
     });
   }
 
@@ -327,132 +453,172 @@ function buildSlides(w) {
     const top = w.devices.topDomains;
     const max = top[0]?.[1] || 1;
     s.push({
-      theme: "blue",
+      key: "DEVICES",
+      ghost: "DEVICES",
       html: `
-        <div class="kicker">Devices</div>
-        <p class="lead">You welcomed</p>
-        <div class="big"><span data-count="${w.devices.count}">0</span></div>
-        <p class="lead">new devices into your home</p>
+        <div class="row">${tag("03 / DEVICES")}${glyph("nodes")}</div>
+        <p class="lead">New devices welcomed</p>
+        <div class="big"><span data-count="${w.devices.count}">0</span><sup>DEV.</sup></div>
         <ol class="rank">${top.map(([n, c], i) => `
-          <li style="--i:${i}"><span class="pos">${i + 1}</span><span class="lbl">${esc(n)}</span>
-          <span class="meter"><i style="--w:${(c / max) * 100}%"></i></span><b>${c}</b></li>`).join("")}
+          <li style="--i:${i}">
+            <span class="idx">${pad(i + 1)}</span>
+            <span class="lbl">${esc(n)}</span>
+            <b>${c}</b>
+            <span class="bar"><i style="--w:${(c / max) * 100}%"></i></span>
+          </li>`).join("")}
         </ol>`,
     });
   }
 
   if (w.devices.topMaker) {
+    const [maker, n] = w.devices.topMaker;
+    const share = n / w.devices.count;
     s.push({
-      theme: "orange",
+      key: "BRAND",
+      ghost: maker.toUpperCase(),
       html: `
-        <div class="kicker">Your top brand</div>
-        <p class="lead">Out of <b>${w.devices.makers}</b> manufacturers, your favorite was</p>
-        <div class="name">${esc(w.devices.topMaker[0])}</div>
-        <p class="sub"><b>${w.devices.topMaker[1]}</b> new devices. That's ${Math.round((w.devices.topMaker[1] / w.devices.count) * 100)}% of everything you added.</p>
-        ${w.devices.room ? `<div class="divider"></div><p class="lead">The room that got the most love:</p><div class="name small">${esc(w.devices.room[0])}</div><p class="sub">${w.devices.room[1]} new devices</p>` : ""}`,
+        <div class="row">${tag("04 / TOP BRAND")}${glyph("quad")}</div>
+        <p class="lead">Most-installed manufacturer</p>
+        <div class="name xl">${esc(maker)}</div>
+        ${pips(share)}
+        <p class="mono sm"><span class="blue">${Math.round(share * 100)}%</span> OF NEW DEVICES · ${n}/${w.devices.count}</p>
+        ${spec([
+          ["MANUFACTURERS", `${w.devices.makers}`],
+          w.devices.room && ["MOST LOVED ROOM", esc(w.devices.room[0]), true],
+          w.devices.room && ["NEW DEVICES THERE", `${w.devices.room[1]}`],
+        ])}`,
     });
   }
 
   if (w.apps.count) {
     s.push({
-      theme: "pink",
+      key: "APPS",
+      ghost: "APPS",
       html: `
-        <div class="kicker">Apps</div>
-        <p class="lead">You installed</p>
-        <div class="big"><span data-count="${w.apps.count}">0</span></div>
-        <p class="lead">apps on your server</p>
-        <div class="chips">${w.apps.names.map((n, i) => `<span style="--i:${i}">${esc(n)}</span>`).join("")}</div>`,
+        <div class="row">${tag("05 / APPS")}${glyph("grid")}</div>
+        <p class="lead">Apps installed on your server</p>
+        <div class="big"><span data-count="${w.apps.count}">0</span><sup>APP</sup></div>
+        <div class="chips">${w.apps.names.map((a, i) => `<span style="--i:${i}"><em>${pad(i + 1)}</em>${esc(a)}</span>`).join("")}
+          ${w.apps.count > w.apps.names.length ? `<span class="more">+${w.apps.count - w.apps.names.length}</span>` : ""}</div>`,
     });
   }
 
   if (w.habits.total) {
-    const owl = w.habits.nightPct >= 20;
+    const h = w.habits;
+    const owl = h.nightPct >= 20;
+    const weekend = !owl && h.weekendPct >= 40;
+    const hours = h.byHour || Array(24).fill(0);
     s.push({
-      theme: "night",
+      key: "HABITS",
+      ghost: owl ? "NIGHT" : weekend ? "WEEKEND" : "DAYTIME",
       html: `
-        <div class="kicker">Your tinkering habits</div>
-        <div class="emoji">${owl ? "🦉" : w.habits.weekendPct >= 40 ? "🛋️" : "☕"}</div>
-        <h2>${owl ? "Night Owl" : w.habits.weekendPct >= 40 ? "Weekend Warrior" : "Daytime Tinkerer"}</h2>
-        <p class="sub"><b>${w.habits.nightPct}%</b> of your setups happened after 10 PM, and <b>${w.habits.weekendPct}%</b> on weekends.</p>
-        <p class="sub">Favorite day: <b>${w.habits.topDay}</b>. Peak hour: <b>${fmtHour(w.habits.peakHour)}</b>.</p>
-        ${bars(w.habits.byMonth, MONTHS)}
-        <p class="foot">Everything you set up, month by month</p>`,
+        <div class="row">${tag("06 / HABITS")}${glyph(owl ? "moon" : weekend ? "house" : "sun")}</div>
+        <p class="lead">Your tinkering style</p>
+        <div class="name xl">${owl ? "Night Owl" : weekend ? "Weekend Warrior" : "Daytime Tinkerer"}</div>
+        ${spec([
+          ["AFTER 22:00", `${h.nightPct}%`],
+          ["ON WEEKENDS", `${h.weekendPct}%`],
+          ["FAVORITE DAY", esc((h.topDay || "–").toUpperCase())],
+          ["PEAK HOUR", fmtHour(h.peakHour), true],
+        ])}
+        ${ticks(hours, hours.map((_, i) => (i % 6 === 0 ? pad(i) : "")), { caption: "SETUPS / HOUR OF DAY", titles: hours.map((_, i) => fmtHour(i)) })}`,
     });
   }
 
   if (w.energy) {
     const e = w.energy;
     s.push({
-      theme: "green",
+      key: "ENERGY",
+      ghost: "kWh",
       html: `
-        <div class="kicker">Energy</div>
-        <p class="lead">Your tracked devices used</p>
-        <div class="big"><span data-count="${Math.round(e.total)}">0</span><small> kWh</small></div>
-        <p class="sub">Your hardest worker: <b>${esc(e.top[0].name)}</b> with ${num(e.top[0].kwh, 1)} kWh (${Math.round((e.top[0].kwh / e.total) * 100)}% of the total).</p>
-        ${bars(e.monthly, MONTHS, { dp: 1 })}
-        <p class="foot">Hungriest month: <b>${MONTHS[e.peakMonth]}</b> · ${e.count} metered device${e.count === 1 ? "" : "s"}</p>`,
+        <div class="row">${tag("07 / ENERGY")}${glyph("bolt")}</div>
+        <p class="lead">Used by your metered devices</p>
+        <div class="big"><span data-count="${Math.round(e.total)}">0</span><sup>kWh</sup></div>
+        ${spec([
+          ["TOP CONSUMER", esc(e.top[0].name), true],
+          ["ITS SHARE", `${Math.round((e.top[0].kwh / e.total) * 100)}% · ${num(e.top[0].kwh, 1)} kWh`],
+          ["HUNGRIEST MONTH", MONTH3[e.peakMonth]],
+          ["METERED DEVICES", `${e.count}`],
+        ])}
+        ${ticks(e.monthly, MON, { caption: "kWh / MONTH", dp: 1, unit: " kWh", titles: MONTH3 })}`,
     });
   }
 
   if (w.climate?.hottest) {
     const c = w.climate;
+    const rooms = c.rooms.slice(0, 5);
+    const lo = Math.floor(Math.min(...rooms.map((r) => r.min)) / 5) * 5;
+    const hi = Math.ceil(Math.max(...rooms.map((r) => r.max)) / 5) * 5;
     s.push({
-      theme: "heat",
+      key: "CLIMATE",
+      ghost: `${Math.round(c.hottest.max)}°`,
       html: `
-        <div class="kicker">Climate</div>
-        <p class="lead">Your warmest moment indoors</p>
-        <div class="big"><span data-count="${c.hottest.max}" data-dp="1">0</span><small>${c.unit}</small></div>
-        <p class="sub">in the <b>${esc(c.hottest.room)}</b>${c.outside ? `, while it hit <b>${num(c.outside.max, 1)}${c.unit}</b> outside in ${MONTHS[c.outside.month]}` : ""}.</p>
-        <div class="divider"></div>
-        <p class="sub">Coolest room on average: <b>${esc(c.coldest.room)}</b> at ${num(c.coldest.mean, 1)}${c.unit}.</p>
-        <div class="temps">${c.rooms.slice(0, 5).map((r, i) => `
-          <div style="--i:${i}"><span>${esc(r.room)}</span><b>${num(r.mean, 1)}°</b></div>`).join("")}</div>
-        <p class="foot">Average temperature by room</p>`,
+        <div class="row">${tag("08 / CLIMATE")}${glyph("thermo")}</div>
+        <p class="lead">Warmest moment indoors</p>
+        <div class="big"><span data-count="${c.hottest.max}" data-dp="1">0</span><sup>${c.unit}</sup></div>
+        ${spec([
+          ["WHERE", esc(c.hottest.room), true],
+          c.outside && ["OUTSIDE PEAK", `${num(c.outside.max, 1)}${c.unit} · ${MONTH3[c.outside.month]}`],
+          ["COOLEST ON AVERAGE", `${esc(c.coldest.room)} · ${num(c.coldest.mean, 1)}${c.unit}`],
+        ])}
+        <figure class="ranges">
+          ${rooms.map((r) => rangeRow(r, lo, hi)).join("")}
+          <figcaption><span>MIN — MEAN — MAX</span><span>${lo}–${hi}${c.unit}</span></figcaption>
+        </figure>`,
     });
   }
 
+  const n = w.now;
   s.push({
-    theme: "violet",
+    key: "INVENTORY",
+    ghost: "INVENTORY",
     html: `
-      <div class="kicker">Your home today</div>
-      <div class="grid">
-        <div><b data-count="${w.now.entities}">0</b><span>entities</span></div>
-        <div><b data-count="${w.now.automations}">0</b><span>automations</span></div>
-        <div><b data-count="${w.devices.total}">0</b><span>devices</span></div>
-        <div><b data-count="${w.now.areas}">0</b><span>areas</span></div>
-        <div><b data-count="${w.now.scripts + w.now.scenes}">0</b><span>scripts &amp; scenes</span></div>
-        <div><b data-count="${w.now.people}">0</b><span>people at home</span></div>
+      <div class="row">${tag("09 / INVENTORY")}${glyph("house")}</div>
+      <p class="lead">Your home today</p>
+      <div class="cells">
+        ${[["grid", n.entities, "ENTITIES"], ["gear", n.automations, "AUTOMATIONS"], ["nodes", w.devices.total, "DEVICES"],
+          ["sq2", n.areas, "AREAS"], ["wave", n.scripts + n.scenes, "SCRIPTS & SCENES"], ["person", n.people, "PEOPLE"]]
+          .map(([g, v, l], i) => `<div style="--i:${i}">${glyph(g)}<b data-count="${v}">0</b><span>${l}</span></div>`).join("")}
       </div>`,
   });
 
+  const arch = w.archetype;
+  const archGlyph = { "The Maker": "wrench", "The Mesh Master": "nodes", "The Climate Commander": "thermo", "The DJ": "wave", "The Automator": "gear" }[arch.name] || "cross";
   s.push({
-    theme: "intro",
+    key: "CLASS",
+    ghost: arch.name.replace(/^The /, "").toUpperCase(),
     html: `
-      <div class="kicker">Your home personality</div>
-      <div class="emoji xl">${w.archetype.emoji}</div>
-      <h1 class="title"><span class="grad">${esc(w.archetype.name)}</span></h1>
-      <p class="sub">${esc(w.archetype.line)}</p>`,
+      <div class="row">${tag("10 / CLASSIFICATION")}${tag("VERIFIED", "blue")}</div>
+      <div class="seal"><i></i>${glyph(archGlyph, "xl")}</div>
+      <p class="mono sm dim">YOUR HOME PERSONALITY</p>
+      <h1 class="title">${esc(arch.name)}</h1>
+      <p class="sub">${esc(arch.line)}</p>
+      ${barcode(arch.name, 60)}`,
   });
 
-  // Shareable summary
+  const style = w.habits.nightPct >= 20 ? "NIGHT OWL" : w.habits.weekendPct >= 40 ? "WEEKEND" : "DAYTIME";
   s.push({
-    theme: "summary",
+    key: "SUMMARY",
+    ghost: "",
     html: `
-      <div class="card-sum">
-        <div class="sum-head"><span class="logo">⌂</span> My ${w.year} Home Wrapped</div>
-        <div class="sum-arch">${w.archetype.emoji} ${esc(w.archetype.name)}</div>
-        <div class="sum-grid">
-          <div><span>Integrations added</span><b>${w.integrations.count}</b></div>
-          <div><span>New devices</span><b>${w.devices.count}</b></div>
-          <div><span>Top brand</span><b>${esc(w.devices.topMaker?.[0] || "–")}</b></div>
-          <div><span>Automations</span><b>${w.now.automations}</b></div>
-          ${w.energy ? `<div><span>Energy tracked</span><b>${num(w.energy.total)} kWh</b></div>` : ""}
-          ${w.climate?.hottest ? `<div><span>Hottest room</span><b>${num(w.climate.hottest.max, 1)}°</b></div>` : ""}
-          <div><span>Top integration</span><b>${esc(w.devices.topDomains[0]?.[0] || "–")}</b></div>
-          <div><span>Tinker style</span><b>${w.habits.nightPct >= 20 ? "Night Owl" : w.habits.weekendPct >= 40 ? "Weekend" : "Daytime"}</b></div>
+      <div class="sticker">
+        <div class="st-hd">${glyph("house", "st-logo")}<div><b>HOME ASSISTANT</b><span>WRAPPED · ${w.year}</span></div><em>©${w.year}</em></div>
+        <div class="st-io">
+          <div><span>INPUT</span><b>${w.integrations.count} INTEGRATIONS · ${w.devices.count} DEVICES</b></div>
+          <div><span>OUTPUT</span><b>${n.automations} AUTOMATIONS</b></div>
         </div>
-        <div class="sum-foot">Made with Home Assistant</div>
+        <dl class="st-rows">
+          <div><dt>CLASS</dt><dd class="blue">${esc(arch.name.toUpperCase())}</dd></div>
+          <div><dt>TOP BRAND</dt><dd>${esc(w.devices.topMaker?.[0] || "–")}</dd></div>
+          <div><dt>TOP INTEGRATION</dt><dd>${esc(w.devices.topDomains[0]?.[0] || "–")}</dd></div>
+          ${w.energy ? `<div><dt>ENERGY TRACKED</dt><dd>${num(w.energy.total)} kWh</dd></div>` : ""}
+          ${w.climate?.hottest ? `<div><dt>HOTTEST ROOM</dt><dd>${num(w.climate.hottest.max, 1)}${w.climate.unit}</dd></div>` : ""}
+          <div><dt>TINKER STYLE</dt><dd>${style}</dd></div>
+        </dl>
+        <div class="st-marks">${["house", "sq2", "bolt", "quad", "ring", "checker"].map((g) => glyph(g)).join("")}</div>
+        <div class="st-ft">${barcode(`${w.year}${arch.name}${w.devices.count}`, 70)}<span>MADE WITH HOME ASSISTANT</span></div>
       </div>
-      <p class="foot">Take a screenshot to share it 📸</p>`,
+      <p class="mono sm dim center">SCREENSHOT TO SHARE ↗</p>`,
   });
 
   return s;
@@ -461,110 +627,225 @@ function buildSlides(w) {
 /* ---------------------------------------------------------------- story -- */
 
 const STORY_CSS = `
-:host { all: initial; }
-.wrap { position: fixed; inset: 0; z-index: 10000; background: #000; display: flex; align-items: center; justify-content: center;
-  font-family: "Figtree", "Roboto", system-ui, -apple-system, sans-serif; color: #fff; -webkit-font-smoothing: antialiased; animation: fadeIn .3s ease; }
-.stage { position: relative; width: min(100vw, calc(100vh * 9 / 16)); height: min(100vh, calc(100vw * 16 / 9)); max-height: 100vh;
-  overflow: hidden; border-radius: 0; }
-@media (min-width: 700px) { .stage { height: min(92vh, 860px); width: calc(min(92vh, 860px) * 9 / 16); border-radius: 24px; box-shadow: 0 30px 80px rgba(0,0,0,.6); } }
-.progress { position: absolute; top: 12px; left: 12px; right: 12px; display: flex; gap: 4px; z-index: 5; }
-.progress i { flex: 1; height: 3px; border-radius: 3px; background: rgba(255,255,255,.3); overflow: hidden; }
-.progress i b { display: block; height: 100%; width: 0; background: #fff; transition: width .3s ease; }
-.progress i.done b, .progress i.cur b { width: 100%; }
-.close { position: absolute; top: 24px; right: 14px; z-index: 6; background: none; border: 0; color: #fff; font-size: 28px; cursor: pointer; opacity: .8; padding: 4px 8px; }
-.tapL, .tapR { position: absolute; top: 0; bottom: 0; z-index: 4; cursor: pointer; }
+:host { all: initial;
+  --ha-blue: #18bcf2; --ha-black: #1d2126; --ha-grey: #6e7191; --ha-white: #f2f4f9;
+  --ink: rgba(242,244,249,.92); --dim: rgba(242,244,249,.55); --faint: rgba(242,244,249,.14); --hair: rgba(242,244,249,.22);
+  --sans: Figtree, "Instrument Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace; }
+.wrap { position: fixed; inset: 0; z-index: 10000; background: #121519; display: flex; align-items: center; justify-content: center;
+  font-family: var(--sans); color: var(--ink); -webkit-font-smoothing: antialiased; animation: fadeIn .3s ease; }
+.stage { position: relative; width: min(100vw, calc(100vh * 9 / 16)); height: min(100vh, calc(100vw * 16 / 9)); overflow: hidden;
+  background: var(--ha-black); container-type: size; }
+@media (min-width: 700px) { .stage { height: min(92vh, 860px); width: calc(min(92vh, 860px) * 9 / 16); border-radius: 18px;
+  box-shadow: 0 30px 80px rgba(0,0,0,.55), 0 0 0 1px rgba(242,244,249,.06); } }
+/* paper grain */
+.stage::after { content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 3; opacity: .09; mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+
+/* drafting sheets */
+.sheets { position: absolute; inset: 0; overflow: hidden; }
+.sheet { position: absolute; inset: -7%; transform: translate(var(--tx), var(--ty)) rotate(var(--rot));
+  background-color: rgba(242,244,249,.018); border: 1px solid rgba(242,244,249,.07);
+  background-image: linear-gradient(rgba(242,244,249,.05) 1px, transparent 1px), linear-gradient(90deg, rgba(242,244,249,.05) 1px, transparent 1px),
+    linear-gradient(rgba(242,244,249,.022) 1px, transparent 1px), linear-gradient(90deg, rgba(242,244,249,.022) 1px, transparent 1px);
+  background-size: 18cqw 18cqw, 18cqw 18cqw, 3.6cqw 3.6cqw, 3.6cqw 3.6cqw; animation: settle 1.2s cubic-bezier(.2,.8,.2,1) both; }
+.sheet svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+.sheet .ln { fill: none; stroke: rgba(242,244,249,.16); stroke-width: .18; }
+.sheet .tx { fill: rgba(242,244,249,.14); }
+.sheet .ghost { font: 900 30px var(--sans); fill: rgba(242,244,249,.07); letter-spacing: -1.5px; }
+.s0 { filter: blur(.3px); opacity: .9; }
+.s1 { filter: blur(1.4px); opacity: .7; }
+.s2 { filter: blur(3.2px); opacity: .85; }
+.sheet.blue .ln { stroke: rgba(24,188,242,.32); }
+.sheet.blue { background-color: rgba(24,188,242,.025); }
+
+/* chrome */
+.progress { position: absolute; top: 12px; left: 16px; right: 16px; display: flex; gap: 3px; z-index: 5; }
+.progress i { flex: 1; height: 2px; background: var(--faint); transition: background .3s; }
+.progress i.done { background: var(--ha-white); }
+.progress i.cur { background: var(--ha-blue); }
+.close { position: absolute; top: 22px; right: 12px; z-index: 6; background: none; border: 0; color: var(--dim); cursor: pointer;
+  font: 500 10px var(--mono); letter-spacing: .12em; padding: 6px; }
+.close:hover { color: var(--ink); }
+.tapL, .tapR { position: absolute; top: 44px; bottom: 0; z-index: 4; cursor: pointer; }
 .tapL { left: 0; width: 30%; } .tapR { right: 0; width: 70%; }
-.slide { position: absolute; inset: 0; padding: 72px 28px 40px; display: flex; flex-direction: column; justify-content: center; gap: 6px;
-  box-sizing: border-box; animation: slideIn .55s cubic-bezier(.2,.8,.2,1); }
-.slide > * { animation: rise .6s cubic-bezier(.2,.8,.2,1) both; }
-.slide > *:nth-child(2) { animation-delay: .08s } .slide > *:nth-child(3) { animation-delay: .16s }
-.slide > *:nth-child(4) { animation-delay: .24s } .slide > *:nth-child(5) { animation-delay: .32s }
-.slide > *:nth-child(6) { animation-delay: .4s } .slide > *:nth-child(n+7) { animation-delay: .48s }
 
-.t-intro { background: radial-gradient(120% 80% at 10% 0%, #18bcf2 0%, transparent 55%), radial-gradient(100% 70% at 100% 100%, #7c3aed 0%, transparent 60%), #0b1020; }
-.t-violet { background: linear-gradient(160deg, #4c1d95, #7c3aed 55%, #c026d3); }
-.t-teal { background: linear-gradient(160deg, #064e3b, #0d9488 60%, #5eead4); }
-.t-blue { background: linear-gradient(165deg, #0c4a6e, #0284c7 55%, #18bcf2); }
-.t-orange { background: linear-gradient(160deg, #7c2d12, #ea580c 55%, #fbbf24); }
-.t-pink { background: linear-gradient(160deg, #831843, #db2777 55%, #f9a8d4); }
-.t-night { background: radial-gradient(70% 50% at 80% 10%, #312e81 0%, transparent 70%), linear-gradient(180deg, #020617, #1e1b4b); }
-.t-green { background: linear-gradient(160deg, #14532d, #16a34a 55%, #bef264); }
-.t-heat { background: linear-gradient(170deg, #1e3a8a 0%, #9333ea 45%, #f97316 100%); }
-.t-summary { background: radial-gradient(100% 60% at 50% 0%, #18bcf2 0%, transparent 60%), #0b1020; align-items: center; }
+.slide { position: absolute; inset: 0; animation: slideIn .45s cubic-bezier(.2,.8,.2,1); }
+.content { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; padding: 30px 6.5cqw 16px; box-sizing: border-box; }
+.hd, .ft { display: flex; align-items: center; gap: 8px; font: 500 9.5px var(--mono); letter-spacing: .12em; color: var(--dim); text-transform: uppercase; }
+.hd .rule, .ft .rule { flex: 1; height: 1px; background: var(--hair); }
+.hd { padding-right: 52px; }
+.ft { margin-top: 10px; }
+.ft .g { width: 14px; height: 14px; color: var(--dim); }
+.body { flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 1.6cqh; min-height: 0; }
+.body > * { animation: rise .55s cubic-bezier(.2,.8,.2,1) both; }
+.body > *:nth-child(2) { animation-delay: .06s } .body > *:nth-child(3) { animation-delay: .12s }
+.body > *:nth-child(4) { animation-delay: .18s } .body > *:nth-child(5) { animation-delay: .24s }
+.body > *:nth-child(n+6) { animation-delay: .3s }
 
-.kicker { font-size: 13px; letter-spacing: .14em; text-transform: uppercase; font-weight: 700; opacity: .85; margin-bottom: 14px; }
-.mega { font-size: 64px; line-height: .95; font-weight: 900; margin: 0; letter-spacing: -.03em; }
-.title { font-size: 44px; line-height: 1; font-weight: 900; margin: 6px 0; letter-spacing: -.02em; }
-h2 { font-size: 36px; margin: 0; font-weight: 900; letter-spacing: -.02em; }
-.grad { background: linear-gradient(90deg, #18bcf2, #a78bfa, #f472b6); -webkit-background-clip: text; background-clip: text; color: transparent; }
-.big { font-size: 112px; line-height: 1; font-weight: 900; letter-spacing: -.04em; font-variant-numeric: tabular-nums; }
-.big small { font-size: 32px; font-weight: 800; letter-spacing: 0; }
-.name { font-size: 44px; font-weight: 900; line-height: 1.05; letter-spacing: -.02em; margin: 4px 0; }
-.name.small { font-size: 30px; }
-.lead { font-size: 20px; margin: 0; font-weight: 600; line-height: 1.3; }
-.sub { font-size: 16px; margin: 8px 0 0; opacity: .9; line-height: 1.45; }
-.foot { font-size: 13px; opacity: .75; margin: 8px 0 0; }
-.hint { margin-top: 36px; font-size: 14px; opacity: .7; animation: pulse 2s infinite !important; }
-.divider { height: 1px; background: rgba(255,255,255,.3); margin: 18px 0; }
-.emoji { font-size: 64px; line-height: 1; margin-bottom: 8px; } .emoji.xl { font-size: 120px; }
+/* type */
+.mono { font-family: var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+.sm { font-size: 10px; margin: 0; }
+.dim { color: var(--dim); }
+.blue { color: var(--ha-blue); }
+.center { text-align: center; }
+.row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.row .g { width: 22px; height: 22px; color: var(--ha-blue); }
+.tag { font: 500 10px var(--mono); letter-spacing: .12em; color: var(--ink); white-space: nowrap; }
+.tag.blue { color: var(--ha-blue); }
+.lead { margin: 1cqh 0 0; font: 500 4.6cqw/1.2 var(--sans); color: var(--dim); }
+.hero { margin: 0; font: 900 21cqw/.85 var(--sans); letter-spacing: -.055em; color: var(--ha-white); }
+.yr { display: flex; align-items: center; justify-content: space-between; font: 700 15cqw/1 var(--mono); letter-spacing: -.02em;
+  color: transparent; -webkit-text-stroke: 1px var(--ha-blue); }
+.yr .g.lg { width: 13cqw; height: 13cqw; color: var(--ha-blue); stroke-width: .9; }
+.big { display: flex; align-items: flex-start; gap: 2cqw; font: 800 27cqw/.9 var(--sans); letter-spacing: -.05em; color: var(--ha-white);
+  font-variant-numeric: tabular-nums; }
+.big sup { font: 500 10px var(--mono); letter-spacing: .12em; color: var(--ha-blue); margin-top: 2.4cqw; border: 1px solid var(--ha-blue); padding: 3px 5px; }
+.name { font: 800 10.5cqw/1 var(--sans); letter-spacing: -.035em; color: var(--ha-white); }
+.name.sm { font-size: 7.5cqw; }
+.name.xl { font-size: 13cqw; line-height: .95; }
+.title { margin: 0; font: 900 12cqw/.95 var(--sans); letter-spacing: -.04em; color: var(--ha-white); }
+.sub { margin: 0; font: 400 4cqw/1.45 "Instrument Sans", var(--sans); color: var(--dim); }
+.hint { margin-top: 1cqh; font-size: 10.5px; color: var(--ha-blue); animation: pulse 1.8s ease-in-out infinite !important; }
 
-.bars { display: flex; gap: 4px; align-items: flex-end; height: 120px; margin-top: 22px; }
-.bar { flex: 1; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 4px; }
-.bar span { width: 100%; height: var(--h); background: rgba(255,255,255,.35); border-radius: 4px 4px 2px 2px; transform-origin: bottom;
-  animation: grow .7s cubic-bezier(.2,.8,.2,1) both; animation-delay: calc(.4s + var(--i) * .04s); }
-.bar.hi span { background: #fff; }
-.bar em { font-style: normal; font-size: 10px; opacity: .7; }
+/* spec block */
+.spec { margin: 0; border-top: 1px solid var(--hair); }
+.spec div { display: flex; justify-content: space-between; gap: 12px; padding: 7px 0; border-bottom: 1px solid var(--hair); }
+.spec dt { font: 500 9.5px var(--mono); letter-spacing: .12em; color: var(--dim); white-space: nowrap; }
+.spec dd { margin: 0; font: 600 12.5px var(--mono); letter-spacing: .04em; color: var(--ink); text-align: right; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spec .hi dd { color: var(--ha-blue); }
+.spec .hi dt::before { content: "▸ "; color: var(--ha-blue); }
 
-.rank { list-style: none; padding: 0; margin: 22px 0 0; display: flex; flex-direction: column; gap: 10px; }
-.rank li { display: grid; grid-template-columns: 22px 1fr 70px 28px; align-items: center; gap: 10px; font-size: 16px; font-weight: 600;
-  animation: rise .5s both; animation-delay: calc(.4s + var(--i) * .08s); }
-.rank .pos { opacity: .6; font-weight: 800; } .rank .lbl { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.rank .meter { height: 6px; background: rgba(255,255,255,.2); border-radius: 6px; overflow: hidden; }
-.rank .meter i { display: block; height: 100%; width: var(--w); background: #fff; border-radius: 6px; animation: growX .8s both .6s; transform-origin: left; }
-.rank b { text-align: right; }
+/* marks */
+.g { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linecap: square; flex: none; }
+.marks { display: flex; gap: 10px; color: var(--dim); }
+.marks .g:first-child { color: var(--ha-blue); }
 
-.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
-.chips span { background: rgba(255,255,255,.18); padding: 8px 14px; border-radius: 999px; font-size: 14px; font-weight: 600;
-  animation: rise .5s both; animation-delay: calc(.4s + var(--i) * .06s); }
+/* histogram */
+.ticks { margin: 0; }
+.tk-plot { position: relative; height: 15cqh; display: flex; align-items: flex-end; gap: 2px; padding-top: 6px;
+  border-bottom: 1px solid var(--hair);
+  background: repeating-linear-gradient(to top, transparent 0 calc(25% - 1px), rgba(242,244,249,.06) calc(25% - 1px) 25%); }
+/* each bar is a thin stem with a cap tick, like a reading on an instrument */
+.tk-plot i { position: relative; flex: 1; height: var(--h); transform-origin: bottom;
+  animation: grow .6s cubic-bezier(.2,.8,.2,1) both; animation-delay: calc(.3s + var(--i) * .025s); }
+.tk-plot i::before { content: ""; position: absolute; left: 32%; right: 32%; top: 0; bottom: 0; background: rgba(242,244,249,.34); }
+.tk-plot i::after { content: ""; position: absolute; left: 8%; right: 8%; top: 0; height: 1px; background: rgba(242,244,249,.7); }
+.tk-plot i.hi::before { background: var(--ha-blue); box-shadow: 0 0 10px rgba(24,188,242,.5); }
+.tk-plot i.hi::after { background: var(--ha-blue); }
+.tk-axis { display: flex; gap: 2px; margin-top: 4px; }
+.tk-axis span { flex: 1; text-align: center; font: 500 8.5px var(--mono); color: var(--dim); }
+.tk-axis span.hi { color: var(--ha-blue); }
+.ticks figcaption, .ranges figcaption { display: flex; justify-content: space-between; margin-top: 6px;
+  font: 500 8.5px var(--mono); letter-spacing: .12em; color: var(--dim); }
 
-.temps { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
-.temps div { display: flex; justify-content: space-between; background: rgba(255,255,255,.12); padding: 8px 12px; border-radius: 10px; font-size: 15px;
-  animation: rise .5s both; animation-delay: calc(.45s + var(--i) * .06s); }
+/* ranking */
+.rank { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--hair); }
+.rank li { display: grid; grid-template-columns: 22px 1fr auto; column-gap: 8px; align-items: baseline; padding: 7px 0 6px;
+  border-bottom: 1px solid var(--hair); animation: rise .45s both; animation-delay: calc(.3s + var(--i) * .06s); }
+.rank .idx { font: 500 9.5px var(--mono); color: var(--ha-blue); }
+.rank .lbl { font: 600 4cqw/1.2 var(--sans); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rank b { font: 700 13px var(--mono); }
+.rank .bar { grid-column: 2 / 4; height: 2px; margin-top: 5px; background: var(--faint); }
+.rank .bar i { display: block; height: 100%; width: var(--w); background: var(--ha-blue); transform-origin: left; animation: growX .8s both .5s; }
 
-.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 6px; }
-.grid div { background: rgba(255,255,255,.14); border-radius: 18px; padding: 18px 16px; display: flex; flex-direction: column; }
-.grid b { font-size: 42px; font-weight: 900; line-height: 1; letter-spacing: -.02em; }
-.grid span { font-size: 13px; opacity: .85; margin-top: 6px; }
+/* proportion */
+.pips { display: grid; grid-template-columns: repeat(24, 1fr); gap: 3px; }
+.pips i { aspect-ratio: 1 / 2.4; border: 1px solid var(--hair); animation: rise .4s both; animation-delay: calc(.3s + var(--i) * .02s); }
+.pips i.on { background: var(--ha-blue); border-color: var(--ha-blue); }
 
-.card-sum { width: 100%; background: linear-gradient(160deg, rgba(255,255,255,.14), rgba(255,255,255,.04)); border: 1px solid rgba(255,255,255,.2);
-  border-radius: 24px; padding: 22px; box-sizing: border-box; }
-.sum-head { font-weight: 800; font-size: 15px; display: flex; align-items: center; gap: 8px; }
-.logo { display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 8px; background: #18bcf2; font-size: 18px; }
-.sum-arch { font-size: 28px; font-weight: 900; margin: 16px 0; letter-spacing: -.02em; }
-.sum-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 12px; }
-.sum-grid div { display: flex; flex-direction: column; min-width: 0; }
-.sum-grid span { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; opacity: .7; }
-.sum-grid b { font-size: 20px; font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sum-foot { margin-top: 18px; font-size: 12px; opacity: .6; }
+/* chips */
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips span { display: inline-flex; gap: 7px; align-items: center; border: 1px solid var(--hair); padding: 6px 9px;
+  font: 500 10.5px var(--mono); letter-spacing: .06em; text-transform: uppercase; animation: rise .4s both; animation-delay: calc(.3s + var(--i) * .05s); }
+.chips em { font-style: normal; color: var(--ha-blue); }
+.chips .more { color: var(--ha-blue); border-color: var(--ha-blue); }
+
+/* label stickers */
+.label { border: 1px solid var(--hair); padding: 10px 12px; background: rgba(29,33,38,.55); backdrop-filter: blur(2px); }
+.label.hi { border-color: var(--ha-blue); }
+.label-hd { display: flex; justify-content: space-between; font: 500 9.5px var(--mono); letter-spacing: .12em; color: var(--dim); margin-bottom: 8px; }
+.label.hi .label-hd span:first-child { color: var(--ha-blue); }
+.label-ft { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-top: 8px; }
+.label-ft .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.barcode { width: 30%; min-width: 70px; height: 18px; fill: var(--ink); flex: none; }
+.leader { display: flex; align-items: center; gap: 8px; color: var(--ha-blue); }
+.leader span { flex: 1; height: 0; border-top: 1px dashed rgba(24,188,242,.6); }
+
+/* climate ranges */
+.ranges { margin: 0; border-top: 1px solid var(--hair); }
+.rng { display: grid; grid-template-columns: 30% 1fr 42px; gap: 10px; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--hair); }
+.rng-l { font: 600 3.6cqw var(--sans); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rng-t { position: relative; height: 10px;
+  background: repeating-linear-gradient(90deg, rgba(242,244,249,.22) 0 1px, transparent 1px 10%) center / 100% 4px no-repeat; }
+.rng-t i { position: absolute; top: 3px; height: 4px; background: rgba(242,244,249,.4); }
+.rng-t b { position: absolute; top: 0; width: 2px; height: 10px; margin-left: -1px; background: var(--ha-blue); }
+.rng-v { font: 600 12px var(--mono); text-align: right; }
+
+/* inventory cells */
+.cells { display: grid; grid-template-columns: 1fr 1fr; border-top: 1px solid var(--hair); border-left: 1px solid var(--hair); }
+.cells div { position: relative; display: flex; flex-direction: column; gap: 4px; padding: 12px; border-right: 1px solid var(--hair);
+  border-bottom: 1px solid var(--hair); animation: rise .45s both; animation-delay: calc(.3s + var(--i) * .05s); }
+.cells .g { position: absolute; top: 10px; right: 10px; width: 16px; height: 16px; color: var(--ha-blue); }
+.cells b { font: 800 10cqw/1 var(--sans); letter-spacing: -.03em; color: var(--ha-white); font-variant-numeric: tabular-nums; }
+.cells span { font: 500 9px var(--mono); letter-spacing: .12em; color: var(--dim); }
+
+/* classification */
+.seal { position: relative; width: 34cqw; height: 34cqw; border: 1px solid var(--ha-blue); border-radius: 50%; display: grid; place-items: center; }
+.seal::before, .seal::after { content: ""; position: absolute; background: rgba(24,188,242,.5); }
+.seal::before { left: -5cqw; right: -5cqw; top: 50%; height: 1px; }
+.seal::after { top: -5cqw; bottom: -5cqw; left: 50%; width: 1px; }
+.seal { background: radial-gradient(circle, var(--ha-black) 0 30%, transparent 31%); }
+.seal::before, .seal::after { z-index: 0; }
+.seal .g.xl { width: 15cqw; height: 15cqw; color: var(--ha-white); stroke-width: 1.1; position: relative; z-index: 1;
+  filter: drop-shadow(0 0 4px var(--ha-black)); }
+.seal i { position: absolute; inset: 9%; border: 1px dashed rgba(24,188,242,.45); border-radius: 50%; }
+.body > .barcode { width: 100%; height: 22px; opacity: .8; }
+
+/* summary sticker */
+.sticker { border: 1px solid var(--ha-white); background: rgba(29,33,38,.82); padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+.st-hd { display: flex; align-items: center; gap: 10px; }
+.st-hd .st-logo { width: 30px; height: 30px; color: var(--ha-blue); stroke-width: 1.6; }
+.st-hd div { display: flex; flex-direction: column; flex: 1; }
+.st-hd b { font: 800 5.4cqw/1 var(--sans); letter-spacing: -.01em; color: var(--ha-white); }
+.st-hd span { font: 500 9.5px var(--mono); letter-spacing: .14em; color: var(--ha-blue); margin-top: 3px; }
+.st-hd em { font: 500 10px var(--mono); font-style: normal; color: var(--dim); align-self: flex-start; }
+.st-io { border: 1px solid var(--hair); background: rgba(242,244,249,.06); }
+.st-io div { display: flex; gap: 10px; padding: 6px 8px; font: 500 10px var(--mono); letter-spacing: .06em; }
+.st-io div + div { border-top: 1px solid var(--hair); }
+.st-io span { color: var(--dim); width: 52px; flex: none; }
+.st-io b { font-weight: 600; color: var(--ink); }
+.st-rows { margin: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 9px 12px; }
+.st-rows div { min-width: 0; }
+.st-rows dt { font: 500 8.5px var(--mono); letter-spacing: .12em; color: var(--dim); }
+.st-rows dd { margin: 2px 0 0; font: 700 4.2cqw/1.15 var(--sans); color: var(--ha-white); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.st-rows dd.blue { color: var(--ha-blue); }
+.st-marks { display: flex; justify-content: space-between; padding: 8px 0; border-top: 1px solid var(--hair); border-bottom: 1px solid var(--hair); color: var(--ink); }
+.st-ft { display: flex; flex-direction: column; gap: 5px; }
+.st-ft .barcode { width: 100%; height: 26px; }
+.st-ft span { font: 500 8.5px var(--mono); letter-spacing: .16em; color: var(--dim); text-align: center; }
 
 @keyframes fadeIn { from { opacity: 0 } }
-@keyframes slideIn { from { opacity: 0; transform: scale(1.04) } }
-@keyframes rise { from { opacity: 0; transform: translateY(18px) } }
+@keyframes slideIn { from { opacity: 0 } }
+@keyframes settle { from { opacity: 0; transform: translate(var(--tx), calc(var(--ty) + 2%)) rotate(calc(var(--rot) * 1.6)); } }
+@keyframes rise { from { opacity: 0; transform: translateY(10px) } }
 @keyframes grow { from { transform: scaleY(0) } }
 @keyframes growX { from { transform: scaleX(0) } }
 @keyframes pulse { 50% { opacity: .35 } }
-@media (prefers-reduced-motion: reduce) { .slide, .slide > *, .bar span, .rank li, .rank .meter i, .chips span, .temps div { animation: none !important; } }
+@media (prefers-reduced-motion: reduce) { .sheet, .slide, .body > *, .tk-plot i, .rank li, .rank .bar i, .pips i, .chips span, .cells div { animation: none !important; } }
 `;
 
 class HaWrappedStory extends HTMLElement {
-  open(slides) {
+  open(slides, year) {
     this.slides = slides;
+    this.year = year;
     this.idx = 0;
     const root = this.shadowRoot || this.attachShadow({ mode: "open" });
     root.innerHTML = `<style>${STORY_CSS}</style>
       <div class="wrap"><div class="stage">
-        <div class="progress">${slides.map(() => "<i><b></b></i>").join("")}</div>
-        <button class="close" aria-label="Close">×</button>
+        <div class="progress">${slides.map(() => "<i></i>").join("")}</div>
+        <button class="close" aria-label="Close">ESC ×</button>
         <div class="holder"></div>
         <div class="tapL"></div><div class="tapR"></div>
       </div></div>`;
@@ -583,9 +864,11 @@ class HaWrappedStory extends HTMLElement {
   // Swap in the full deck once data arrives, without re-animating the intro.
   setSlides(slides) {
     this.slides = slides;
-    this.shadowRoot.querySelector(".progress").innerHTML = slides.map(() => "<i><b></b></i>").join("");
+    this.shadowRoot.querySelector(".progress").innerHTML = slides.map(() => "<i></i>").join("");
     const hint = this.holder.querySelector(".hint");
-    if (hint) hint.textContent = "Tap to begin →";
+    if (hint) hint.textContent = "TAP TO BEGIN →";
+    const no = this.holder.querySelector(".sheetno");
+    if (no) no.textContent = this.sheetNo();
     this.updateProgress();
     // A tap that came in while loading moves on as soon as the deck is ready
     if (this._wantNext) { this._wantNext = false; this.go(this.idx + 1); }
@@ -598,6 +881,7 @@ class HaWrappedStory extends HTMLElement {
     this.show();
   }
   get loading() { return this.slides.length === 1; }
+  sheetNo() { return this.loading ? `SHEET 01/··` : `SHEET ${pad(this.idx + 1)}/${pad(this.slides.length)}`; }
   updateProgress() {
     this.shadowRoot.querySelectorAll(".progress i").forEach((el, i) => {
       el.className = i < this.idx ? "done" : i === this.idx ? "cur" : "";
@@ -605,7 +889,15 @@ class HaWrappedStory extends HTMLElement {
   }
   show() {
     const s = this.slides[this.idx];
-    this.holder.innerHTML = `<section class="slide t-${s.theme}">${s.html}</section>`;
+    const yy = String(this.year).slice(-2);
+    this.holder.innerHTML = `<section class="slide">
+      ${sheets(this.idx + 1, s.ghost)}
+      <div class="content">
+        <header class="hd"><span>HA/WRAPPED</span><span class="rule"></span><span class="sheetno">${this.sheetNo()}</span></header>
+        <div class="body">${s.html}</div>
+        <footer class="ft"><span>DWG HA-${yy}-${pad(this.idx + 1)}</span><span class="rule"></span><span>${esc(s.key)}</span>${glyph("cross")}</footer>
+      </div>
+    </section>`;
     this.updateProgress();
     this.countUp();
   }
@@ -646,12 +938,14 @@ class HaWrappedCard extends HTMLElement {
       this.prefetch().catch(() => {}); // warm up in the background; errors surface on play
     }
   }
+  getCardSize() { return 3; }
+  static getStubConfig() { return {}; }
 
   // Data is gathered once per browser and cached for a few hours, so only the
   // very first run waits on the recorder.
   prefetch() {
     if (this._dataPromise) return this._dataPromise;
-    const key = `ha-wrapped:v1:${this.year}`;
+    const key = `ha-wrapped:v2:${this.year}`;
     try {
       const cached = JSON.parse(localStorage.getItem(key) || "null");
       if (cached && Date.now() - cached.at < CACHE_MS) return (this._dataPromise = Promise.resolve(cached.data));
@@ -666,37 +960,41 @@ class HaWrappedCard extends HTMLElement {
     this._dataPromise.catch(() => { this._dataPromise = null; }); // allow retry
     return this._dataPromise;
   }
-  getCardSize() { return 3; }
-  static getStubConfig() { return {}; }
 
   render() {
     this.rendered = true;
     const root = this.shadowRoot || this.attachShadow({ mode: "open" });
     root.innerHTML = `
       <style>
-        ha-card, .card { display: block; overflow: hidden; border-radius: var(--ha-card-border-radius, 12px); cursor: pointer; color: #fff;
-          background: radial-gradient(120% 90% at 0% 0%, #18bcf2 0%, transparent 55%), radial-gradient(100% 90% at 100% 100%, #7c3aed 0%, transparent 60%), #0b1020;
-          font-family: var(--ha-font-family-body, "Figtree", system-ui, sans-serif); }
-        .in { padding: 22px; display: flex; align-items: center; gap: 16px; }
-        .txt { flex: 1; }
-        .k { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; opacity: .8; font-weight: 700; }
-        .h { font-size: 28px; font-weight: 900; line-height: 1.05; margin: 4px 0 6px; letter-spacing: -.02em; }
-        .s { font-size: 13px; opacity: .85; }
-        button { all: unset; width: 56px; height: 56px; border-radius: 50%; background: #fff; color: #0b1020; display: grid; place-items: center;
-          font-size: 22px; box-shadow: 0 6px 20px rgba(0,0,0,.35); transition: transform .2s; flex: none; }
-        .card:hover button { transform: scale(1.08); }
-        .err { color: #fecaca; font-size: 12px; margin-top: 6px; }
+        :host { --ha-blue: #18bcf2; --ha-black: #1d2126; --ha-white: #f2f4f9; --dim: rgba(242,244,249,.55); --hair: rgba(242,244,249,.2);
+          --sans: Figtree, "Instrument Sans", system-ui, sans-serif; --mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, monospace; }
+        ha-card { position: relative; display: block; overflow: hidden; cursor: pointer; color: var(--ha-white); background-color: var(--ha-black);
+          border-radius: var(--ha-card-border-radius, 12px); font-family: var(--sans);
+          background-image: linear-gradient(rgba(242,244,249,.05) 1px, transparent 1px), linear-gradient(90deg, rgba(242,244,249,.05) 1px, transparent 1px),
+            linear-gradient(rgba(242,244,249,.02) 1px, transparent 1px), linear-gradient(90deg, rgba(242,244,249,.02) 1px, transparent 1px);
+          background-size: 80px 80px, 80px 80px, 16px 16px, 16px 16px; }
+        .in { position: relative; padding: 16px 18px 14px; display: flex; flex-direction: column; gap: 10px; }
+        .top, .bottom { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+          font: 500 10px var(--mono); letter-spacing: .12em; color: var(--dim); }
+        .top .rule { flex: 1; height: 1px; background: var(--hair); }
+        .top .ref { color: var(--ha-blue); }
+        .h { display: flex; align-items: baseline; gap: 12px; font: 900 40px/.9 var(--sans); letter-spacing: -.05em; }
+        .h .yr { font: 700 26px var(--mono); letter-spacing: -.02em; color: transparent; -webkit-text-stroke: 1px var(--ha-blue); }
+        .s { font: 500 10px var(--mono); letter-spacing: .12em; color: var(--dim); }
+        .bar { flex: 1; height: 18px; fill: var(--ha-white); opacity: .7; }
+        button { all: unset; flex: none; font: 600 11px var(--mono); letter-spacing: .14em; color: var(--ha-black); background: var(--ha-blue);
+          padding: 8px 12px; transition: transform .15s; }
+        ha-card:hover button { transform: translateX(2px); }
+        .err { color: #ffb4a8; font: 500 11px var(--mono); }
       </style>
-      <ha-card class="card"><div class="in">
-        <div class="txt">
-          <div class="k">Home Assistant</div>
-          <div class="h">Your ${this.year} Wrapped</div>
-          <div class="s">Your year in smart home, in ${"one tap"}.</div>
-          <div class="err" hidden></div>
-        </div>
-        <button aria-label="Play">▶</button>
+      <ha-card><div class="in">
+        <div class="top"><span>[ HA/WRAPPED ]</span><span class="rule"></span><span class="ref">REF.${this.year}</span></div>
+        <div class="h">Wrapped <span class="yr">${this.year}</span></div>
+        <div class="s">YOUR YEAR IN SMART HOME — TAP THROUGH</div>
+        <div class="err" hidden></div>
+        <div class="bottom">${barcode(`wrapped${this.year}`, 60).replace('class="barcode"', 'class="bar"')}<button aria-label="Play">▶ PLAY</button></div>
       </div></ha-card>`;
-    root.querySelector(".card").addEventListener("click", () => this.play());
+    root.querySelector("ha-card").addEventListener("click", () => this.play());
   }
 
   async play() {
@@ -705,7 +1003,7 @@ class HaWrappedCard extends HTMLElement {
     // Open straight away on the intro; the rest of the deck slots in when ready.
     const story = document.createElement("ha-wrapped-story");
     document.body.appendChild(story);
-    story.open([introSlide(this.year, true)]);
+    story.open([introSlide(this.year, true)], this.year);
     try {
       const data = await this.prefetch();
       if (story.isConnected) story.setSlides(buildSlides(data));
