@@ -6,7 +6,7 @@ A year-in-review story for your home. A dashboard card opens a full-screen, tap-
 
 1. Intro
 2. Integrations added this year, by month
-3. Local: the share of your integrations that run in your home
+3. Local: the share of your integrations that run in your home, and up to five that use the cloud
 4. New devices, ranked by integration
 5. Brands: every manufacturer in your home, and this year's top brand
 6. Made by you: ESPHome devices you built yourself
