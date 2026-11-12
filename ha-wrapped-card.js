@@ -1,5 +1,5 @@
 /**
- * Home Assistant Wrapped — a year-in-review story for your smart home.
+ * Home Assistant Unwrapped — a year-in-review story for your home.
  *
  * Install through HACS / the Marketplace (custom repository), or copy to
  * /config/www/ha-wrapped-card.js and add it as a dashboard resource
@@ -11,7 +11,7 @@
  */
 
 const VERSION = "1.2.0";
-console.info(`%c HA-WRAPPED-CARD %c v${VERSION} `, "color:#1d2126;background:#18bcf2;font-weight:700", "color:#18bcf2;background:#1d2126");
+console.info(`%c HOME ASSISTANT UNWRAPPED %c v${VERSION} `, "color:#1d2126;background:#18bcf2;font-weight:700", "color:#18bcf2;background:#1d2126");
 
 const HELPER_DOMAINS = new Set([
   "template", "group", "utility_meter", "switch_as_x", "derivative", "integration",
@@ -75,6 +75,16 @@ async function collectWrapped(hass, year, onCore) {
   for (const e of entries) firstSeen[e.domain] = Math.min(firstSeen[e.domain] ?? Infinity, e.created_at || 0);
   const newDomains = [...new Set(integrationsNew.map((e) => e.domain))].filter((d) => inYear(firstSeen[d]));
 
+  // Where each integration runs, from its manifest's iot_class (all integrations
+  // set up today, helpers left out)
+  const iotClass = Object.fromEntries(manifests.map((m) => [m.domain, m.iot_class || ""]));
+  const reach = { local: 0, cloud: 0, other: 0 };
+  for (const e of userEntries) {
+    if (HELPER_DOMAINS.has(e.domain)) continue;
+    const c = iotClass[e.domain] || "";
+    reach[c.startsWith("local") ? "local" : c.startsWith("cloud") ? "cloud" : "other"]++;
+  }
+
   // ---- devices
   const domainOfDevice = (d) => {
     const e = d.config_entries?.map((id) => entryById[id]).find(Boolean);
@@ -92,12 +102,20 @@ async function collectWrapped(hass, year, onCore) {
     return [...m.entries()].sort((a, b) => b[1] - a[1]);
   };
   const topDomains = countBy(newDevices, domainOfDevice).map(([d, n]) => [nameOf(d), n, d]);
-  const topMakers = countBy(newDevices, (d) => {
+  const makerOf = (d) => {
     const m = (d.manufacturer || "").trim();
-    if (!m || /^(home assistant|esphome|zigbee|unknown)$/i.test(m)) return null;
+    if (!m || /^(home assistant|esphome|espressif|zigbee|unknown)$/i.test(m)) return null;
     return m.replace(/\s*\(.*\)$/, "").replace(/ of sweden$/i, "").replace(/, inc\.?$/i, "")
       .replace(/^\w/, (c) => c.toUpperCase());
-  });
+  };
+  const topMakers = countBy(newDevices, makerOf);
+  const allMakers = countBy(things, makerOf);
+
+  // ESPHome devices you built yourself. Ready-made ones (from a maker who sets
+  // an ESPHome "project") report their version as "x.y (ESPHome z)".
+  const esphomeAll = things.filter((d) => domainOfDevice(d) === "esphome" && !d.via_device_id);
+  const diy = esphomeAll.filter((d) => !/\(ESPHome /.test(d.sw_version || ""));
+  const diyNew = diy.filter((d) => inYear(d.created_at)).sort((a, b) => a.created_at - b.created_at);
   const busiestRoom = countBy(newDevices, (d) => areaName[d.area_id]);
 
   // ---- habits (when do you tinker?)
@@ -111,8 +129,20 @@ async function collectWrapped(hass, year, onCore) {
   events.forEach((p) => byHour[p.hour]++);
   const peakHour = byHour.indexOf(Math.max(...byHour));
 
-  // ---- statistics
   const entityById = Object.fromEntries(entities.map((e) => [e.entity_id, e]));
+
+  // ---- automations. The UI editor names each automation after the moment it
+  // was created (a millisecond timestamp), which is exact, also for old ones.
+  const autos = Object.keys(hass.states).filter((id) => id.startsWith("automation.")).map((id) => {
+    const cfg = String(hass.states[id].attributes?.id ?? "");
+    const exact = /^\d{13}$/.test(cfg) ? +cfg / 1000 : null;
+    return { id, cfg, exact, ts: exact ?? entityById[id]?.created_at ?? null, name: hass.states[id].attributes?.friendly_name || id };
+  });
+  const autosNew = autos.filter((a) => inYear(a.ts));
+  // Only exact dates can name the oldest; the registry's date can be a migration date
+  const oldestAuto = autos.filter((a) => a.exact).sort((a, b) => a.exact - b.exact)[0];
+
+  // ---- statistics
   const areaOfEntity = (id) => {
     const e = entityById[id];
     if (!e) return null;
@@ -129,6 +159,8 @@ async function collectWrapped(hass, year, onCore) {
   const statsPromise = (async () => {
     let energy = null;
     let climate = null;
+    let solar = null;
+    let blueprints = null;
     try {
       const statIds = await statIdsReq;
       const sensorStat = (s) => s.statistic_id.startsWith("sensor.");
@@ -140,12 +172,47 @@ async function collectWrapped(hass, year, onCore) {
       const period = (ids, types) => ids.length ? hass.callWS({
         type: "recorder/statistics_during_period",
         start_time: start.toISOString(), end_time: end.toISOString(),
-        statistic_ids: ids.map((s) => s.statistic_id), period: "month", types,
+        statistic_ids: ids.map((s) => s.statistic_id ?? s), period: "month", types,
       }) : {};
-      const [eStats, tStats] = await Promise.all([
+
+      // Solar comes from the energy dashboard's settings
+      const prefs = await hass.callWS({ type: "energy/get_prefs" }).catch(() => null);
+      const sources = prefs?.energy_sources || [];
+      // Solar only counts when its sensor still exists, not a leftover in the energy settings
+      const solarIds = sources.filter((x) => x.type === "solar").map((x) => x.stat_energy_from)
+        .filter((id) => id && (entityById[id] || hass.states[id]));
+      const returnIds = sources.filter((x) => x.type === "grid")
+        .flatMap((g) => [...(g.flow_to || []).map((f) => f.stat_energy_to), g.stat_energy_to]).filter(Boolean);
+      const unitOf = (id) => statIds.find((x) => x.statistic_id === id)?.statistics_unit_of_measurement;
+      const kwhFactor = (id) => ({ Wh: 0.001, MWh: 1000, GJ: 277.778 }[unitOf(id)] ?? 1);
+
+      const [eStats, tStats, xStats] = await Promise.all([
         period(energyIds, ["change"]),
         period(tempIds, ["mean", "min", "max"]),
+        period([...new Set([...solarIds, ...returnIds])], ["change"]),
       ]);
+      const monthsOf = (ids, factor = () => 1) => {
+        const m = Array(12).fill(0);
+        for (const id of ids) (xStats[id] || []).forEach((r) => { m[new Date(r.start).getMonth()] += Math.max(0, r.change || 0) * factor(id); });
+        return m;
+      };
+      const sum = (a) => a.reduce((x, y) => x + y, 0);
+      if (solarIds.length) {
+        const monthly = monthsOf(solarIds, kwhFactor);
+        const total = sum(monthly);
+        if (total > 0.5) {
+          const returned = Math.min(total, sum(monthsOf(returnIds, kwhFactor)));
+          solar = { total, monthly, returned, peakMonth: monthly.indexOf(Math.max(...monthly)), selfShare: (total - returned) / total };
+        }
+      }
+
+      // How many of this year's automations came from a blueprint
+      const toRead = autosNew.filter((a) => a.cfg).slice(0, 50);
+      if (toRead.length && hass.callApi) {
+        const cfgs = await Promise.all(toRead.map((a) =>
+          hass.callApi("GET", `config/automation/config/${encodeURIComponent(a.cfg)}`).catch(() => null)));
+        blueprints = cfgs.filter((c) => c?.use_blueprint).length;
+      }
 
       // Energy: one total per device (devices often expose several energy sensors)
       const perDevice = new Map();
@@ -209,7 +276,7 @@ async function collectWrapped(hass, year, onCore) {
     } catch (err) {
       console.warn("ha-wrapped: statistics unavailable", err);
     }
-    return { energy, climate };
+    return { energy, climate, solar, blueprints };
   })();
 
   // ---- home today
@@ -228,7 +295,7 @@ async function collectWrapped(hass, year, onCore) {
   // ---- personality
   const has = (d) => newDevices.filter((x) => domainOfDevice(x) === d).length;
   const archetypes = [
-    { score: has("esphome") * 3, name: "The Maker", emoji: "🛠️", line: "You don't buy a smart home. You build one." },
+    { score: diyNew.length * 3, name: "The Maker", emoji: "🛠️", line: "You don't buy a smart home. You build one." },
     { score: (has("zha") + has("zwave_js") + has("matter") + has("mqtt")) * 1.2, name: "The Mesh Master", emoji: "🕸️", line: "Your radios have never been busier." },
     { score: dom("climate") * 3, name: "The Climate Commander", emoji: "🌡️", line: "Every room, exactly the right temperature." },
     { score: dom("media_player") * 1.2, name: "The DJ", emoji: "🎧", line: "Music in every room, on cue." },
@@ -241,8 +308,6 @@ async function collectWrapped(hass, year, onCore) {
       count: integrationsNew.length,
       domains: newDomains.length,
       helpers: helpersNew.length,
-      first: integrationsNew[0] && { name: nameOf(integrationsNew[0].domain), title: integrationsNew[0].title, date: integrationsNew[0].created_at },
-      latest: integrationsNew.at(-1) && { name: nameOf(integrationsNew.at(-1).domain), title: integrationsNew.at(-1).title, date: integrationsNew.at(-1).created_at },
       byMonth: (() => { const m = Array(12).fill(0); integrationsNew.forEach((e) => m[parts(e.created_at).month]++); return m; })(),
     },
     devices: {
@@ -256,6 +321,17 @@ async function collectWrapped(hass, year, onCore) {
       latest: newDevices.at(-1) && { name: newDevices.at(-1).name_by_user || newDevices.at(-1).name, date: newDevices.at(-1).created_at },
     },
     apps: { count: newApps.length, names: newApps.map((a) => a.name).slice(0, 6) },
+    reach,
+    brands: { count: allMakers.length, names: allMakers.slice(0, 12).map(([m]) => m) },
+    esphome: {
+      diy: diy.length, diyNew: diyNew.length, ready: esphomeAll.length - diy.length,
+      names: (diyNew.length ? diyNew : diy).map((d) => d.name_by_user || d.name).slice(0, 6),
+    },
+    automations: {
+      count: autosNew.length, total: autos.length,
+      byMonth: (() => { const m = Array(12).fill(0); autosNew.forEach((a) => m[parts(a.ts).month]++); return m; })(),
+      oldest: oldestAuto && { name: oldestAuto.name, date: oldestAuto.exact },
+    },
     habits: {
       total: events.length,
       nightPct: events.length ? Math.round((night / events.length) * 100) : 0,
@@ -263,7 +339,7 @@ async function collectWrapped(hass, year, onCore) {
       byMonth, peakMonth: byMonth.indexOf(Math.max(...byMonth)),
       topDay: byDay[0]?.[0], peakHour, byHour,
     },
-    energy: null, climate: null, statsPending: true, now,
+    energy: null, climate: null, solar: null, blueprints: null, statsPending: true, now,
     archetype: archetypes[0],
   };
   onCore?.(core);
@@ -273,8 +349,6 @@ async function collectWrapped(hass, year, onCore) {
 
 /* -------------------------------------------------------------- helpers -- */
 
-const fmtDot = (ts, tz) => new Intl.DateTimeFormat("en-GB", { timeZone: tz, day: "2-digit", month: "2-digit" })
-  .format(new Date(ts * 1000)).replace("/", ".");
 const fmtHour = (h) => `${String(h).padStart(2, "0")}:00`;
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const num = (n, d = 0) => Number(n).toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d });
@@ -302,7 +376,7 @@ const GLYPHS = {
   nodes: '<circle cx="5" cy="6" r="2.2"/><circle cx="19" cy="6" r="2.2"/><circle cx="12" cy="18.5" r="2.2"/><path d="M7.2 6h9.6M6.2 8l4.7 8.6M17.8 8l-4.7 8.6"/>',
   thermo: '<path d="M10 4.5a2 2 0 0 1 4 0v9.7a4.2 4.2 0 1 1-4 0z"/><path d="M12 9v8.5"/>',
   wave: '<path d="M1.5 12h3l2.2-6.5 3.3 13 3.2-10 2.3 6.5 1.8-3h5.2"/>',
-  wrench: '<path d="M14.5 3.5a5 5 0 0 0 6 6L10 20a2.1 2.1 0 0 1-3-3L17.5 6.5a5 5 0 0 0-3-3z"/>',
+  chip: '<rect x="6" y="6" width="12" height="12"/><rect x="9.5" y="9.5" width="5" height="5"/><path d="M9.5 2v4M14.5 2v4M9.5 18v4M14.5 18v4M2 9.5h4M2 14.5h4M18 9.5h4M18 14.5h4"/>',
   gear: '<circle cx="12" cy="12" r="3.5"/><circle cx="12" cy="12" r="8"/><path d="M12 1.5v3M12 19.5v3M1.5 12h3M19.5 12h3"/>',
   moon: '<path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/>',
   sun: '<circle cx="12" cy="12" r="4.5"/><path d="M12 1.5v3.5M12 19v3.5M1.5 12H5M19 12h3.5M4.6 4.6l2.4 2.4M17 17l2.4 2.4M4.6 19.4 7 17M17 7l2.4-2.4"/>',
@@ -327,6 +401,11 @@ function barcode(text, bars = 44) {
   }
   return `<svg class="barcode" viewBox="0 0 ${x} 20" preserveAspectRatio="none" aria-hidden="true">${out}</svg>`;
 }
+
+// Official Home Assistant logo (main lockup, colour on dark), from the Brand
+// Assets API: brands.openhomefoundation.org/api/home-assistant/logo/screen/lockup/main/color/dark/svg
+// Embedded so the card works without internet. Never redraw or retype it.
+const HA_LOGO = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTcyMSIgaGVpZ2h0PSIyNDAiIHZpZXdCb3g9IjAgMCAxNzIxIDI0MCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTI0MCAyMTguNzYyQzI0MCAyMjcuMDEyIDIzMy4yNSAyMzMuNzYyIDIyNSAyMzMuNzYySDE1QzYuNzUgMjMzLjc2MiAwIDIyNy4wMTIgMCAyMTguNzYyVjEyOC43NjJDMCAxMjAuNTEyIDQuNzcgMTA4Ljk5MyAxMC42MSAxMDMuMTUzTDEwOS4zOSA0LjM3MjVDMTE1LjIyIC0xLjQ1NzUgMTI0Ljc3IC0xLjQ1NzUgMTMwLjYgNC4zNzI1TDIyOS4zOSAxMDMuMTYyQzIzNS4yMiAxMDguOTkzIDI0MCAxMjAuNTIyIDI0MCAxMjguNzcyVjIxOC43NzJWMjE4Ljc2MloiIGZpbGw9IiNGMkY0RjkiLz4KPHBhdGggZD0iTTIyOS4zOSAxMDMuMTUzTDEzMC42MSA0LjM3MjVDMTI0Ljc4IC0xLjQ1NzUgMTE1LjIzIC0xLjQ1NzUgMTA5LjQgNC4zNzI1TDEwLjYxIDEwMy4xNTNDNC43OCAxMDguOTgzIDAgMTIwLjUxMiAwIDEyOC43NjJWMjE4Ljc2MkMwIDIyNy4wMTIgNi43NSAyMzMuNzYyIDE1IDIzMy43NjJIMTA3LjI3TDY2LjY0IDE5My4xMzJDNjQuNTUgMTkzLjg1MiA2Mi4zMiAxOTQuMjYyIDYwIDE5NC4yNjJDNDguNyAxOTQuMjYyIDM5LjUgMTg1LjA2MiAzOS41IDE3My43NjJDMzkuNSAxNjIuNDYyIDQ4LjcgMTUzLjI2MiA2MCAxNTMuMjYyQzcxLjMgMTUzLjI2MiA4MC41IDE2Mi40NjIgODAuNSAxNzMuNzYyQzgwLjUgMTc2LjA5MiA4MC4wOSAxNzguMzIyIDc5LjM3IDE4MC40MTJMMTExIDIxMi4wNDJWOTYuMTYyNUMxMDQuMiA5Mi44MjI1IDk5LjUgODUuODQyNSA5OS41IDc3Ljc3MjVDOTkuNSA2Ni40NzI1IDEwOC43IDU3LjI3MjUgMTIwIDU3LjI3MjVDMTMxLjMgNTcuMjcyNSAxNDAuNSA2Ni40NzI1IDE0MC41IDc3Ljc3MjVDMTQwLjUgODUuODQyNSAxMzUuOCA5Mi44MjI1IDEyOSA5Ni4xNjI1VjE3Ny40MzJMMTYwLjQ2IDE0NS45NzJDMTU5Ljg0IDE0NC4wMTIgMTU5LjUgMTQxLjkzMiAxNTkuNSAxMzkuNzcyQzE1OS41IDEyOC40NzIgMTY4LjcgMTE5LjI3MiAxODAgMTE5LjI3MkMxOTEuMyAxMTkuMjcyIDIwMC41IDEyOC40NzIgMjAwLjUgMTM5Ljc3MkMyMDAuNSAxNTEuMDcyIDE5MS4zIDE2MC4yNzIgMTgwIDE2MC4yNzJDMTc3LjUgMTYwLjI3MiAxNzUuMTIgMTU5LjgwMyAxNzIuOTEgMTU4Ljk4MkwxMjkgMjAyLjg5MlYyMzMuNzcySDIyNUMyMzMuMjUgMjMzLjc3MiAyNDAgMjI3LjAyMiAyNDAgMjE4Ljc3MlYxMjguNzcyQzI0MCAxMjAuNTIyIDIzNS4yMyAxMDkuMDAzIDIyOS4zOSAxMDMuMTYyVjEwMy4xNTNaIiBmaWxsPSIjMThCQ0YyIi8+CjxwYXRoIGQ9Ik0zMzYuMDQgNDYuNTU1OEgzNjAuOFYxMDcuNTU2TDQyNS4xNiAxMDcuNzU2VjQ2LjU1NThINDUwLjE2VjE5Mi41NTZINDI1LjE2VjEyOS43NzZMMzYwLjggMTI5LjU3NlYxOTIuNTc2SDMzNkwzMzYuMDQgNDYuNTU1OFoiIGZpbGw9IiNGMkY0RjkiLz4KPHBhdGggZD0iTTUyMi44IDkxLjE4NThDNTM3LjkgOTEuMTg1OCA1NTAuMjAzIDk2LjAzNTggNTU5LjcxIDEwNS43MzZDNTY5LjIxNyAxMTUuNDM2IDU3My45NyAxMjcuOTA2IDU3My45NyAxNDMuMTQ2QzU3My45NyAxNTguMzEyIDU2OS4yMTcgMTcwLjc0NiA1NTkuNzEgMTgwLjQ0NkM1NTAuMjAzIDE5MC4xNDYgNTM3LjkgMTk0Ljk5NiA1MjIuOCAxOTQuOTk2QzUwNy41NiAxOTQuOTk2IDQ5NS4xOSAxOTAuMTQ2IDQ4NS42OSAxODAuNDQ2QzQ3Ni4xOSAxNzAuNzQ2IDQ3MS40MzcgMTU4LjMxMiA0NzEuNDMgMTQzLjE0NkM0NzEuNDMgMTI3LjgxMiA0NzYuMTgzIDExNS4zMjkgNDg1LjY5IDEwNS42OTZDNDk1LjE5NyA5Ni4wNjI1IDUwNy41NjcgOTEuMjI1OCA1MjIuOCA5MS4xODU4Wk01MjIuOCAxNzMuNzA2QzUzMC44NzMgMTczLjcwNiA1MzcuNDMzIDE3MC44NTkgNTQyLjQ4IDE2NS4xNjZDNTQ3LjUyNyAxNTkuNDcyIDU1MC4wNDcgMTUyLjA2NiA1NTAuMDQgMTQyLjk0NkM1NTAuMDQgMTMzLjgzOSA1NDcuNTIgMTI2LjQ2NiA1NDIuNDggMTIwLjgyNkM1MzcuNDQgMTE1LjE4NiA1MzAuODggMTEyLjM3MiA1MjIuOCAxMTIuMzg2QzUxNC41MzMgMTEyLjM4NiA1MDcuODY3IDExNS4xOTkgNTAyLjggMTIwLjgyNkM0OTcuNzMzIDEyNi40NTIgNDk1LjE5MyAxMzMuODI2IDQ5NS4xOCAxNDIuOTQ2QzQ5NS4xOCAxNTIuMDY2IDQ5Ny43MiAxNTkuNDcyIDUwMi44IDE2NS4xNjZDNTA3Ljg4IDE3MC44NTkgNTE0LjU0NyAxNzMuNzA2IDUyMi44IDE3My43MDZaIiBmaWxsPSIjRjJGNEY5Ii8+CjxwYXRoIGQ9Ik03NDIuNjggMTI5Ljc3NlYxOTIuNTY2SDcxOS42OFYxMzMuMzc2QzcxOS42OCAxMjYuNTQ5IDcxNy45MjMgMTIxLjIxNiA3MTQuNDEgMTE3LjM3NkM3MTAuODk3IDExMy41MzYgNzA2LjExIDExMS42MTMgNzAwLjA1IDExMS42MDZDNjkzLjYxIDExMS42MDYgNjg4LjQ2NyAxMTMuNzA2IDY4NC42MiAxMTcuOTA2QzY4MC43NzMgMTIyLjEwNiA2NzguODUzIDEyNy45ODIgNjc4Ljg2IDEzNS41MzZWMTkyLjUzNkg2NTUuNjdWMTMzLjM3NkM2NTUuNjcgMTI2LjU0OSA2NTMuOTYgMTIxLjIxNiA2NTAuNTQgMTE3LjM3NkM2NDcuMTIgMTEzLjUzNiA2NDIuMzgzIDExMS42MTMgNjM2LjMzIDExMS42MDZDNjI5Ljg5IDExMS42MDYgNjI0LjcxNyAxMTMuNzA2IDYyMC44MSAxMTcuOTA2QzYxNi45MDMgMTIyLjEwNiA2MTQuOTUgMTI3Ljk4MiA2MTQuOTUgMTM1LjUzNlYxOTIuNTM2SDU5MS4zMlY5My45MjU4SDYxMy4zMkw2MTQuMSAxMDMuMzk2QzYxOS44MzMgOTQuOTk1OCA2MjkuMTY3IDkwLjc5NTggNjQyLjEgOTAuNzk1OEM2NDkuNjUzIDkwLjc5NTggNjU2LjE5NyA5Mi4zNTkyIDY2MS43MyA5NS40ODU4QzY2Ny4yNTcgOTguNjA4IDY3MS42NjIgMTAzLjM5MSA2NzQuMzIgMTA5LjE1NkM2NzYuNzA4IDEwMy40NTUgNjgwLjkzMSA5OC43MTQxIDY4Ni4zMiA5NS42ODU4QzY5MS44OCA5Mi40MjU4IDY5OC41MDMgOTAuNzk1OCA3MDYuMTkgOTAuNzk1OEM3MTcuMzkgOTAuNzk1OCA3MjYuMjc3IDk0LjI0NTggNzMyLjg1IDEwMS4xNDZDNzM5LjQyMyAxMDguMDQ2IDc0Mi43IDExNy41ODkgNzQyLjY4IDEyOS43NzZaIiBmaWxsPSIjRjJGNEY5Ii8+CjxwYXRoIGQ9Ik04NTcuMjggMTUxLjkzNkg3ODEuN0M3ODIuNDggMTU5LjM1NiA3ODUuMjggMTY1LjAyMiA3OTAuMSAxNjguOTM2Qzc5NC45MiAxNzIuODQ5IDgwMS4wNCAxNzQuNzk2IDgwOC40NiAxNzQuNzc2QzgyMC41IDE3NC43NzYgODI4LjkzIDE2OS43NzYgODMzLjc1IDE1OS43NzZMODUzLjQ4IDE2Ny41ODZDODQ5LjkzNyAxNzYuMDQzIDg0My43OTkgMTgzLjE1NSA4MzUuOTUgMTg3Ljg5NkM4MjcuOTUgMTkyLjc4OSA4MTguNzg3IDE5NS4yMzIgODA4LjQ2IDE5NS4yMjZDNzkzLjg3MyAxOTUuMjI2IDc4Mi4wNCAxOTAuNDU2IDc3Mi45NiAxODAuOTE2Qzc2My44OCAxNzEuMzc2IDc1OS4zMzcgMTU4Ljg1OSA3NTkuMzMgMTQzLjM2NkM3NTkuMzMgMTI3Ljg3MiA3NjMuOTA3IDExNS4yNzYgNzczLjA2IDEwNS41NzZDNzgyLjIxMyA5NS44NzU4IDc5NC4xNzMgOTEuMDI1OCA4MDguOTQgOTEuMDI1OEM4MjMuNDYgOTEuMDI1OCA4MzUuMTQ3IDk1LjgwOTIgODQ0IDEwNS4zNzZDODUyLjg1MyAxMTQuOTQyIDg1Ny4yOCAxMjcuNTQyIDg1Ny4yOCAxNDMuMTc2VjE1MS45MzZaTTc4Mi4wOSAxMzUuMzI2SDgzMy4yNkM4MzIuOCAxMjcuMzI2IDgzMC4zNzcgMTIxLjIyMiA4MjUuOTkgMTE3LjAxNkM4MjEuNjAzIDExMi44MDkgODE1LjY5MyAxMTAuNzI5IDgwOC4yNiAxMTAuNzc2QzgwMC45MjcgMTEwLjc3NiA3OTQuOTI3IDExMi45MDYgNzkwLjI2IDExNy4xNjZDNzg1LjU5MyAxMjEuNDI2IDc4Mi44NyAxMjcuNDc5IDc4Mi4wOSAxMzUuMzI2WiIgZmlsbD0iI0YyRjRGOSIvPgo8cGF0aCBkPSJNMTAwOS41MyAxNTguNTc2SDk1My45N0w5NDEuOTcgMTkyLjU3Nkg5MTYuMzhMOTY5LjExIDQ2LjU3NThIOTk0LjdMMTA0Ny41MyAxOTIuNTc2SDEwMjEuMzZMMTAwOS41MyAxNTguNTc2Wk0xMDAyLjMxIDEzNy41NzZMOTgxLjkgNzkuMTc1OEw5NjEuMjkgMTM3LjU3NkgxMDAyLjMxWiIgZmlsbD0iI0YyRjRGOSIvPgo8cGF0aCBkPSJNMTA5My44NiAxNzYuMTQ2QzEwOTguNzQgMTc2LjE0NiAxMTAyLjYgMTc1LjE4NiAxMTA1LjQzIDE3My4yNjZDMTEwNi44MiAxNzIuMzM1IDExMDcuOTQgMTcxLjA1NyAxMTA4LjY5IDE2OS41NkMxMTA5LjQzIDE2OC4wNjIgMTEwOS43OCAxNjYuMzk2IDExMDkuNjggMTY0LjcyNkMxMTA5LjY4IDE1OS40NTkgMTEwNi4xMyAxNTUuOTQyIDEwOTkuMDQgMTU0LjE3NkwxMDg1LjQ2IDE1MC41NjZDMTA2Ni43OSAxNDUuNDg2IDEwNTcuNDYgMTM1Ljg4MiAxMDU3LjQ2IDEyMS43NTZDMTA1Ny40NiAxMTIuNzA5IDEwNjAuNzUgMTA1LjMxOSAxMDY3LjMyIDk5LjU4NThDMTA3My44OSA5My44NTI1IDEwODIuNzUgOTAuOTg5MSAxMDkzLjg4IDkwLjk5NThDMTEwMy44NCA5MC45OTU4IDExMTIuMTcgOTMuMjcyNSAxMTE4Ljg4IDk3LjgyNThDMTEyMi4xMiA5OS45MzM1IDExMjQuODkgMTAyLjY4NyAxMTI3LjAxIDEwNS45MTNDMTEyOS4xNCAxMDkuMTM5IDExMzAuNTcgMTEyLjc2OSAxMTMxLjIzIDExNi41NzZMMTExMC4wNCAxMjEuNTc2QzExMDkuODYgMTE5Ljg5MyAxMTA5LjMzIDExOC4yNjcgMTEwOC40OCAxMTYuODA0QzExMDcuNjMgMTE1LjM0IDExMDYuNDggMTE0LjA3MyAxMTA1LjExIDExMy4wODZDMTEwMi4wNCAxMTAuOTI5IDEwOTguMzYgMTA5LjgzIDEwOTQuNjEgMTA5Ljk1NkMxMDkwLjM4IDEwOS45NTYgMTA4Ni45NiAxMTEuMDE2IDEwODQuMzYgMTEzLjEzNkMxMDgzLjExIDExNC4xMDggMTA4Mi4xIDExNS4zNjIgMTA4MS40MiAxMTYuNzk1QzEwODAuNzQgMTE4LjIyOCAxMDgwLjQxIDExOS44IDEwODAuNDUgMTIxLjM4NkMxMDgwLjQyIDEyMi42NjkgMTA4MC42NyAxMjMuOTQzIDEwODEuMTcgMTI1LjEyM0MxMDgxLjY4IDEyNi4zMDMgMTA4Mi40MyAxMjcuMzYxIDEwODMuMzggMTI4LjIyNkMxMDg1LjM0IDEzMC4wNDYgMTA4OC4zNyAxMzEuNTA5IDEwOTIuNDYgMTMyLjYxNkwxMTA1Ljg0IDEzNS45MzZDMTExNC43NiAxMzguMzQ5IDExMjEuNTYgMTQxLjk5NiAxMTI2LjI1IDE0Ni44NzZDMTEyOC41NiAxNDkuMjcxIDExMzAuMzYgMTUyLjEwMiAxMTMxLjU3IDE1NS4yMDJDMTEzMi43NyAxNTguMzAzIDExMzMuMzQgMTYxLjYxMiAxMTMzLjI1IDE2NC45MzZDMTEzMy4yNSAxNzQuMTg5IDExMjkuNzcgMTgxLjU0NiAxMTIyLjggMTg3LjAwNkMxMTE1LjgzIDE5Mi40NjYgMTEwNi4yMyAxOTUuMjAyIDEwOTMuOTkgMTk1LjIxNkMxMDgyLjY2IDE5NS4yMTYgMTA3My41NyAxOTIuNzI2IDEwNjYuNzQgMTg3Ljc0NkMxMDYzLjQ0IDE4NS40MDUgMTA2MC42NSAxODIuNDAzIDEwNTguNTcgMTc4LjkzMkMxMDU2LjQ4IDE3NS40NiAxMDU1LjE0IDE3MS41OTMgMTA1NC42MyAxNjcuNTc2TDEwNzYuMjEgMTYzLjc2NkMxMDc2LjM0IDE2NS41ODMgMTA3Ni44OCAxNjcuMzQ3IDEwNzcuNzggMTY4LjkyOEMxMDc4LjY5IDE3MC41MDkgMTA3OS45NCAxNzEuODY1IDEwODEuNDQgMTcyLjg5NkMxMDg0LjYgMTc1LjA2NiAxMDg4LjcyIDE3Ni4xNDYgMTA5My44NiAxNzYuMTQ2WiIgZmlsbD0iI0YyRjRGOSIvPgo8cGF0aCBkPSJNMTE4My40NiAxNzYuMTQ2QzExODguMzUgMTc2LjE0NiAxMTkyLjIgMTc1LjE0NiAxMTk1LjA0IDE3My4yNjZDMTE5Ni40MyAxNzIuMzMyIDExOTcuNTUgMTcxLjA1NCAxMTk4LjI5IDE2OS41NTdDMTE5OS4wMyAxNjguMDYgMTE5OS4zNyAxNjYuMzk1IDExOTkuMjggMTY0LjcyNkMxMTk5LjI4IDE1OS40NTkgMTE5NS43MyAxNTUuOTQyIDExODguNjQgMTU0LjE3NkwxMTc1LjA3IDE1MC41NjZDMTE1Ni40IDE0NS40ODYgMTE0Ny4wNyAxMzUuODgyIDExNDcuMDcgMTIxLjc1NkMxMTQ3LjA3IDExMi43MDkgMTE1MC4zNiAxMDUuMzE5IDExNTYuOTMgOTkuNTg1OEMxMTYzLjUgOTMuODUyNSAxMTcyLjM2IDkwLjk4OTEgMTE4My40OSA5MC45OTU4QzExOTMuNDUgOTAuOTk1OCAxMjAxLjc4IDkzLjI3MjUgMTIwOC40OSA5Ny44MjU4QzEyMTEuNzMgOTkuOTM0NyAxMjE0LjUgMTAyLjY4OCAxMjE2LjYyIDEwNS45MTRDMTIxOC43NSAxMDkuMTQgMTIyMC4xOSAxMTIuNzY5IDEyMjAuODUgMTE2LjU3NkwxMTk5LjY1IDEyMS41NzZDMTE5OS40NyAxMTkuODkzIDExOTguOTQgMTE4LjI2NyAxMTk4LjA5IDExNi44MDRDMTE5Ny4yNCAxMTUuMzQgMTE5Ni4wOSAxMTQuMDczIDExOTQuNzIgMTEzLjA4NkMxMTkxLjY1IDExMC45MjkgMTE4Ny45NyAxMDkuODMgMTE4NC4yMiAxMDkuOTU2QzExNzkuOTkgMTA5Ljk1NiAxMTc2LjU3IDExMS4wMTYgMTE3My45NyAxMTMuMTM2QzExNzIuNzIgMTE0LjEwOSAxMTcxLjcxIDExNS4zNjMgMTE3MS4wMyAxMTYuNzk2QzExNzAuMzYgMTE4LjIyOSAxMTcwLjAyIDExOS44MDEgMTE3MC4wNiAxMjEuMzg2QzExNzAuMDMgMTIyLjY2OSAxMTcwLjI4IDEyMy45NDMgMTE3MC43OSAxMjUuMTIzQzExNzEuMjkgMTI2LjMwMyAxMTcyLjA0IDEyNy4zNjEgMTE3Mi45OSAxMjguMjI2QzExNzQuOTkgMTMwLjA0NiAxMTc3Ljk5IDEzMS41MDYgMTE4Mi4wOCAxMzIuNjE2TDExOTUuNDYgMTM1LjkzNkMxMjA0LjM3IDEzOC4zNDkgMTIxMS4xNyAxNDEuOTk2IDEyMTUuODcgMTQ2Ljg3NkMxMjE4LjE3IDE0OS4yNzIgMTIxOS45OCAxNTIuMTAzIDEyMjEuMTggMTU1LjIwM0MxMjIyLjM4IDE1OC4zMDQgMTIyMi45NiAxNjEuNjEyIDEyMjIuODcgMTY0LjkzNkMxMjIyLjg3IDE3NC4xODkgMTIxOS4zOSAxODEuNTQ2IDEyMTIuNDIgMTg3LjAwNkMxMjA1LjQ1IDE5Mi40NjYgMTE5NS44NSAxOTUuMjAyIDExODMuNjEgMTk1LjIxNkMxMTcyLjI4IDE5NS4yMTYgMTE2My4xOSAxOTIuNzI2IDExNTYuMzYgMTg3Ljc0NkMxMTUzLjA2IDE4NS40MDUgMTE1MC4yNyAxODIuNDAzIDExNDguMTkgMTc4LjkzMkMxMTQ2LjEgMTc1LjQ2IDExNDQuNzYgMTcxLjU5MyAxMTQ0LjI1IDE2Ny41NzZMMTE2NS44NCAxNjMuNzY2QzExNjUuOTcgMTY1LjU4MiAxMTY2LjUgMTY3LjM0NiAxMTY3LjQxIDE2OC45MjdDMTE2OC4zMSAxNzAuNTA4IDExNjkuNTYgMTcxLjg2NCAxMTcxLjA2IDE3Mi44OTZDMTE3NC4yIDE3NS4wNjYgMTE3OC4zMiAxNzYuMTQ2IDExODMuNDYgMTc2LjE0NloiIGZpbGw9IiNGMkY0RjkiLz4KPHBhdGggZD0iTTEyMzcuOTEgNTkuNzc1OEMxMjM3Ljg4IDU3LjgwMTQgMTIzOC4yNCA1NS44NDAxIDEyMzguOTcgNTQuMDA4NEMxMjM5LjcxIDUyLjE3NjYgMTI0MC44MSA1MC41MTE3IDEyNDIuMiA0OS4xMTI2QzEyNDMuNiA0Ny43MTM1IDEyNDUuMjYgNDYuNjA4NiAxMjQ3LjA5IDQ1Ljg2MzZDMTI0OC45MiA0NS4xMTg2IDEyNTAuODggNDQuNzQ4NyAxMjUyLjg1IDQ0Ljc3NThDMTI1NC44MSA0NC43NDU3IDEyNTYuNzUgNDUuMTIgMTI1OC41NiA0NS44NzU0QzEyNjAuMzYgNDYuNjMwOCAxMjYyIDQ3Ljc1MSAxMjYzLjM1IDQ5LjE2NThDMTI2Ni4xNCA1MS45NzU4IDEyNjcuNzEgNTUuNzc1NSAxMjY3LjcxIDU5LjczNThDMTI2Ny43MSA2My42OTYyIDEyNjYuMTQgNjcuNDk1OCAxMjYzLjM1IDcwLjMwNThDMTI2MiA3MS43MzU5IDEyNjAuMzggNzIuODcwMSAxMjU4LjU3IDczLjYzNjNDMTI1Ni43NiA3NC40MDI0IDEyNTQuODEgNzQuNzgzNyAxMjUyLjg1IDc0Ljc1NThDMTI1MC44OCA3NC43ODE1IDEyNDguOTMgNzQuMzk5NSAxMjQ3LjExIDczLjYzMzdDMTI0NS4yOSA3Mi44Njc5IDEyNDMuNjYgNzEuNzM0OSAxMjQyLjMgNzAuMzA1OEMxMjQwLjkgNjguOTM3NiAxMjM5Ljc4IDY3LjI5OTQgMTIzOS4wMyA2NS40ODk3QzEyMzguMjcgNjMuNjggMTIzNy44OSA2MS43MzY0IDEyMzcuOTEgNTkuNzc1OFpNMTI2NC42NyA5My45NTU4VjE5Mi41ODZIMTI0MS4wM1Y5My45MjU4TDEyNjQuNjcgOTMuOTU1OFoiIGZpbGw9IiNGMkY0RjkiLz4KPHBhdGggZD0iTTEzMjEuODUgMTc2LjE0NkMxMzI2LjczIDE3Ni4xNDYgMTMzMC41OSAxNzUuMTg2IDEzMzMuNDIgMTczLjI2NkMxMzM0LjgxIDE3Mi4zMzMgMTMzNS45MyAxNzEuMDU2IDEzMzYuNjggMTY5LjU1OEMxMzM3LjQyIDE2OC4wNjEgMTMzNy43NiAxNjYuMzk2IDEzMzcuNjcgMTY0LjcyNkMxMzM3LjY3IDE1OS40NTkgMTMzNC4xMiAxNTUuOTQyIDEzMjcuMDIgMTU0LjE3NkwxMzEzLjQ1IDE1MC41NjZDMTI5NC43OCAxNDUuNDg2IDEyODUuNDUgMTM1Ljg4MiAxMjg1LjQ1IDEyMS43NTZDMTI4NS40NSAxMTIuNzA5IDEyODguNzQgMTA1LjMxOSAxMjk1LjMxIDk5LjU4NThDMTMwMS44OCA5My44NTI1IDEzMTAuNzQgOTAuOTg5MSAxMzIxLjg4IDkwLjk5NThDMTMzMS44NCA5MC45OTU4IDEzNDAuMTcgOTMuMjcyNSAxMzQ2Ljg4IDk3LjgyNThDMTM1MC4xMSA5OS45MzY2IDEzNTIuODggMTAyLjY5MSAxMzU1LjAxIDEwNS45MTZDMTM1Ny4xMyAxMDkuMTQyIDEzNTguNTcgMTEyLjc3IDEzNTkuMjMgMTE2LjU3NkwxMzM4LjA0IDEyMS41NzZDMTMzNy44NiAxMTkuODkzIDEzMzcuMzMgMTE4LjI2NyAxMzM2LjQ4IDExNi44MDRDMTMzNS42MyAxMTUuMzQgMTMzNC40OCAxMTQuMDczIDEzMzMuMTEgMTEzLjA4NkMxMzMwLjA0IDExMC45MzIgMTMyNi4zNiAxMDkuODMzIDEzMjIuNjEgMTA5Ljk1NkMxMzE4LjM4IDEwOS45NTYgMTMxNC45NiAxMTEuMDE2IDEzMTIuMzUgMTEzLjEzNkMxMzExLjEgMTE0LjExMSAxMzEwLjEgMTE1LjM2NSAxMzA5LjQyIDExNi43OTdDMTMwOC43NCAxMTguMjMgMTMwOC40MSAxMTkuODAyIDEzMDguNDUgMTIxLjM4NkMxMzA4LjQyIDEyMi42NjkgMTMwOC42NyAxMjMuOTQzIDEzMDkuMTcgMTI1LjEyM0MxMzA5LjY4IDEyNi4zMDMgMTMxMC40MyAxMjcuMzYxIDEzMTEuMzggMTI4LjIyNkMxMzEzLjMzIDEzMC4wNDYgMTMxNi4zNiAxMzEuNTA5IDEzMjAuNDYgMTMyLjYxNkwxMzMzLjg0IDEzNS45MzZDMTM0Mi43NiAxMzguMzQ5IDEzNDkuNTYgMTQxLjk5NiAxMzU0LjI1IDE0Ni44NzZDMTM1Ni41NiAxNDkuMjcxIDEzNTguMzYgMTUyLjEwMiAxMzU5LjU3IDE1NS4yMDJDMTM2MC43NyAxNTguMzAzIDEzNjEuMzQgMTYxLjYxMiAxMzYxLjI1IDE2NC45MzZDMTM2MS4yNSAxNzQuMTg5IDEzNTcuNzcgMTgxLjU0NiAxMzUwLjggMTg3LjAwNkMxMzQzLjgzIDE5Mi40NjYgMTMzNC4yMyAxOTUuMjAyIDEzMjEuOTkgMTk1LjIxNkMxMzEwLjY2IDE5NS4yMTYgMTMwMS41OCAxOTIuNzI2IDEyOTQuNzUgMTg3Ljc0NkMxMjkxLjQ0IDE4NS40MDggMTI4OC42NiAxODIuNDA3IDEyODYuNTcgMTc4LjkzNUMxMjg0LjQ5IDE3NS40NjIgMTI4My4xNSAxNzEuNTk0IDEyODIuNjQgMTY3LjU3NkwxMzA0LjIyIDE2My43NjZDMTMwNC4zNSAxNjUuNTgyIDEzMDQuODggMTY3LjM0NiAxMzA1Ljc5IDE2OC45MjdDMTMwNi42OSAxNzAuNTA4IDEzMDcuOTQgMTcxLjg2NCAxMzA5LjQ0IDE3Mi44OTZDMTMxMi41OCAxNzUuMDY2IDEzMTYuNyAxNzYuMTQ2IDEzMjEuODUgMTc2LjE0NloiIGZpbGw9IiNGMkY0RjkiLz4KPHBhdGggZD0iTTE0MzEuODYgMTkyLjU1NkMxNDI2LjIzIDE5My45MTMgMTQyMC40NiAxOTQuNjY3IDE0MTQuNjcgMTk0LjgwNkMxNDA0LjcxIDE5NC44MDYgMTM5Ni45NSAxOTIuMDY5IDEzOTEuMzggMTg2LjU5NkMxMzg1LjgxIDE4MS4xMjMgMTM4My4wMyAxNzIuOTg2IDEzODMuMDMgMTYyLjE4NlYxMTMuOTQ2SDEzNjcuODlWOTMuOTQ1OEgxMzgzLjAzVjYzLjE2NThIMTQwNi40N1Y5My45MjU4SDE0MjkuMjJWMTEzLjkyNkgxNDA2LjQ3VjE1Ny45MjZDMTQwNi40NyAxNjguNTkyIDE0MTAuNiAxNzMuOTI2IDE0MTguODcgMTczLjkyNkMxNDIyLjI5IDE3My43ODIgMTQyNS42NyAxNzMuMDkgMTQyOC44NyAxNzEuODc2TDE0MzEuODYgMTkyLjU1NloiIGZpbGw9IiNGMkY0RjkiLz4KPHBhdGggZD0iTTE1MTEuMDEgMTkyLjU1NkMxNTEwLjE2IDE4OC44NjMgMTUwOS42IDE4NS4xMDggMTUwOS4zNSAxODEuMzI2QzE1MDYuMjggMTg1LjcyOSAxNTAyLjA4IDE4OS4yMjIgMTQ5Ny4xOSAxOTEuNDM2QzE0OTEuNDggMTk0LjAzOSAxNDg1LjI2IDE5NS4zMjQgMTQ3OC45OCAxOTUuMTk2QzE0NjguMTcgMTk1LjE5NiAxNDU5LjUgMTkyLjMxNiAxNDUyLjk4IDE4Ni41NTZDMTQ0Ni40NiAxODAuNzk2IDE0NDMuMjEgMTcyLjk5OSAxNDQzLjIyIDE2My4xNjZDMTQ0My4yMiAxNTMuNTI2IDE0NDYuNDMgMTQ1Ljk4OSAxNDUyLjg0IDE0MC41NTZDMTQ1OS4yNSAxMzUuMTIyIDE0NjguMDIgMTMyLjQwMiAxNDc5LjE1IDEzMi4zOTZIMTUwOC44VjEyOC41OTZDMTUwOC44IDEyMi40MDkgMTUwNi45OSAxMTcuNzg2IDE1MDMuMzggMTE0LjcyNkMxNDk5Ljc3IDExMS42NjYgMTQ5NC43MSAxMTAuMTM2IDE0ODguMiAxMTAuMTM2QzE0NzYuNjggMTEwLjEzNiAxNDY4LjQxIDExNC45NTIgMTQ2My4zOSAxMjQuNTg2TDE0NDYuMjEgMTE0LjUyNkMxNDU0LjU0IDk4LjgzOTIgMTQ2OC45NiA5MC45OTU4IDE0ODkuNDcgOTAuOTk1OEMxNTAxLjkgOTAuOTk1OCAxNTEyLjA4IDk0LjE4NTggMTUyMC4wMyAxMDAuNTY2QzE1MjcuOTggMTA2Ljk0NiAxNTMxLjk4IDExNy4zMjkgMTUzMi4wMyAxMzEuNzE2VjE3MC45NzZDMTUzMi4wMyAxODIuMTAyIDE1MzIuNjEgMTg5LjI5NiAxNTMzLjc4IDE5Mi41NTZIMTUxMS4wMVpNMTUwOS4wMSAxNDguNzA2SDE0ODQuNjlDMTQ3OS4xNiAxNDguNzA2IDE0NzQuODcgMTQ5Ljk3NiAxNDcxLjggMTUyLjUxNkMxNDcwLjI4IDE1My43ODYgMTQ2OS4wOCAxNTUuMzkxIDE0NjguMjggMTU3LjIwM0MxNDY3LjQ4IDE1OS4wMTYgMTQ2Ny4xMiAxNjAuOTg4IDE0NjcuMjEgMTYyLjk2NkMxNDY3LjIxIDE2Ny41ODYgMTQ2OC43NyAxNzEuMTAyIDE0NzEuOSAxNzMuNTE2QzE0NzUuMDMgMTc1LjkyNiAxNDc5LjQ4IDE3Ny4xMjYgMTQ4NS4yOCAxNzcuMTI2QzE0OTIuMjQgMTc3LjEyNiAxNDk3Ljk0IDE3NC45MjkgMTUwMi4zNyAxNzAuNTM2QzE1MDYuOCAxNjYuMTQyIDE1MDkuMDIgMTU5LjYxNiAxNTA5LjAxIDE1MC45NTZWMTQ4LjcwNloiIGZpbGw9IiNGMkY0RjkiLz4KPHBhdGggZD0iTTE2NDUuNTMgMTMxLjcxNlYxOTIuNTU2SDE2MjJWMTM2Ljc3NkMxNjIyIDEyNy4zOTYgMTYxOS43OSAxMjAuOTgyIDE2MTUuMzYgMTE3LjUzNkMxNjExLjE4IDExNC4xMDUgMTYwNS45MiAxMTIuMjcyIDE2MDAuNTEgMTEyLjM2NkMxNTk3LjM3IDExMi4yNzIgMTU5NC4yNCAxMTIuODAyIDE1OTEuMzEgMTEzLjkyNUMxNTg4LjM4IDExNS4wNDcgMTU4NS42OSAxMTYuNzQgMTU4My40MiAxMTguOTA2QzE1NzguODcgMTIzLjI2NiAxNTc2LjYgMTI5LjQ4MiAxNTc2LjU5IDEzNy41NTZWMTkyLjU1NkgxNTUyLjk2VjkzLjkyNThIMTU3NS4xMkwxNTc1LjkgMTA0LjU2NkMxNTc4Ljk2IDEwMC4xODYgMTU4My4xOSA5Ni43NTI0IDE1ODguMTEgOTQuNjU1OEMxNTkzLjYgOTIuMTgzOSAxNTk5LjU3IDkwLjkzNSAxNjA1LjU5IDkwLjk5NThDMTYxOC4zNSA5MC45OTU4IDE2MjguMiA5NC41MjU4IDE2MzUuMTMgMTAxLjU4NkMxNjQyLjA2IDEwOC42NDYgMTY0NS41MyAxMTguNjg5IDE2NDUuNTMgMTMxLjcxNloiIGZpbGw9IiNGMkY0RjkiLz4KPHBhdGggZD0iTTE3MjAuOTggMTkyLjU1NkMxNzE1LjM1IDE5My45MDIgMTcwOS41OSAxOTQuNjQ2IDE3MDMuOCAxOTQuNzc2QzE2OTMuODQgMTk0Ljc3NiAxNjg2LjA4IDE5Mi4wMzkgMTY4MC41MSAxODYuNTY2QzE2NzQuOTQgMTgxLjA5MyAxNjcyLjE2IDE3Mi45NTYgMTY3Mi4xNiAxNjIuMTU2VjExMy45NDZIMTY1Ny4wMlY5My45NDU4SDE2NzIuMTZWNjMuMTY1OEgxNjk1LjU5VjkzLjkyNThIMTcxOC4zNVYxMTMuOTI2SDE2OTUuNTlWMTU3LjkyNkMxNjk1LjU5IDE2OC41OTIgMTY5OS43MyAxNzMuOTI2IDE3MDggMTczLjkyNkMxNzExLjQyIDE3My43ODIgMTcxNC44IDE3My4wOSAxNzE4IDE3MS44NzZMMTcyMC45OCAxOTIuNTU2WiIgZmlsbD0iI0YyRjRGOSIvPgo8L3N2Zz4=";
 
 const tag = (text, cls = "") => `<span class="tag ${cls}">[ ${text} ]</span>`;
 
@@ -398,9 +477,9 @@ function introSlide(year, loading = false) {
     key: "INTRO",
     ghost: String(year),
     html: `
-      <div class="row">${tag("YEAR IN REVIEW")}${tag(`REF.${year}`, "blue")}</div>
-      <p class="mono sm dim">HOME ASSISTANT — ANNUAL REPORT</p>
-      <h1 class="hero">Wrapped<span class="blue">.</span></h1>
+      <div class="row">${tag("YOUR HOME")}${tag(`REF.${year}`, "blue")}</div>
+      <p class="mono sm dim">HOME ASSISTANT — YEAR IN REVIEW</p>
+      <h1 class="hero">Unwrapped<span class="blue">.</span></h1>
       <div class="yr"><span>${year}</span>${glyph("cross", "lg")}</div>
       ${spec([
         ["SUBJECT", "YOUR HOME"],
@@ -418,7 +497,7 @@ function readingsSlide(year) {
     key: "READINGS",
     ghost: "SCAN",
     html: `
-      <div class="row">${tag("07 / READINGS")}${glyph("wave")}</div>
+      <div class="row">${tag("{{NO}} / READINGS")}${glyph("wave")}</div>
       <p class="lead">Reading a year of sensor history</p>
       <div class="scan" aria-hidden="true"><i></i></div>
       ${spec([
@@ -433,8 +512,6 @@ function readingsSlide(year) {
 
 function buildSlides(w) {
   const s = [];
-  const tz = w.tz;
-  const yy = String(w.year).slice(-2);
 
   s.push(introSlide(w.year));
 
@@ -445,7 +522,7 @@ function buildSlides(w) {
       key: "INTEGRATIONS",
       ghost: "INTEGRATIONS",
       html: `
-        <div class="row">${tag("01 / INTEGRATIONS")}${glyph("plug")}</div>
+        <div class="row">${tag("{{NO}} / INTEGRATIONS")}${glyph("plug")}</div>
         <p class="lead">Connected this year</p>
         <div class="big"><span data-count="${i.count}">0</span><sup>INT.</sup></div>
         ${spec([
@@ -457,26 +534,23 @@ function buildSlides(w) {
     });
   }
 
-  if (w.integrations.first) {
-    const f = w.integrations.first;
-    const l = w.integrations.latest;
-    const months = Math.max(0, Math.round((l.date - f.date) / (86400 * 30.4)));
-    s.push({
-      key: "ORIGIN",
-      ghost: "ORIGIN",
+  if (w.reach) {
+    const r = w.reach;
+    const all = r.local + r.cloud + r.other;
+    if (all) s.push({
+      key: "LOCAL",
+      ghost: "LOCAL",
       html: `
-        <div class="row">${tag("02 / ORIGIN")}${glyph("bracket")}</div>
-        <div class="label">
-          <div class="label-hd"><span>FIRST ENTRY</span><span>${fmtDot(f.date, tz)}.${yy}</span></div>
-          <div class="name">${esc(f.name)}</div>
-          <div class="label-ft"><span class="mono sm dim">${esc(f.title)}</span>${barcode(f.name)}</div>
-        </div>
-        <div class="leader mono sm"><span></span>${months} MONTH${months === 1 ? "" : "S"} LATER<span></span></div>
-        <div class="label hi">
-          <div class="label-hd"><span>LATEST ENTRY</span><span>${fmtDot(l.date, tz)}.${yy}</span></div>
-          <div class="name sm">${esc(l.name)}</div>
-          <div class="label-ft"><span class="mono sm dim">${esc(l.title)}</span>${barcode(l.name)}</div>
-        </div>`,
+        <div class="row">${tag("{{NO}} / LOCAL")}${glyph("house")}</div>
+        <p class="lead">Your home, kept at home</p>
+        <div class="big"><span data-count="${Math.round((r.local / all) * 100)}">0</span><sup>% LOCAL</sup></div>
+        ${pips(r.local / all)}
+        <p class="mono sm dim">SHARE OF YOUR INTEGRATIONS THAT RUN IN YOUR HOME</p>
+        ${spec([
+          ["RUN LOCALLY", `${r.local}`, true],
+          ["USE THE CLOUD", `${r.cloud}`],
+          r.other && ["OTHER", `${r.other}`],
+        ])}`,
     });
   }
 
@@ -487,7 +561,7 @@ function buildSlides(w) {
       key: "DEVICES",
       ghost: "DEVICES",
       html: `
-        <div class="row">${tag("03 / DEVICES")}${glyph("nodes")}</div>
+        <div class="row">${tag("{{NO}} / DEVICES")}${glyph("nodes")}</div>
         <p class="lead">New devices welcomed</p>
         <div class="big"><span data-count="${w.devices.count}">0</span><sup>DEV.</sup></div>
         <ol class="rank">${top.map(([n, c], i) => `
@@ -501,23 +575,60 @@ function buildSlides(w) {
     });
   }
 
-  if (w.devices.topMaker) {
-    const [maker, n] = w.devices.topMaker;
-    const share = n / w.devices.count;
+  if (w.brands?.count > 1 || w.devices.topMaker) {
+    const b = w.brands;
+    const [maker, n] = w.devices.topMaker || [];
     s.push({
-      key: "BRAND",
-      ghost: maker.toUpperCase(),
+      key: "BRANDS",
+      ghost: "BRANDS",
       html: `
-        <div class="row">${tag("04 / TOP BRAND")}${glyph("quad")}</div>
-        <p class="lead">Most-installed manufacturer</p>
-        <div class="name xl">${esc(maker)}</div>
-        ${pips(share)}
-        <p class="mono sm"><span class="blue">${Math.round(share * 100)}%</span> OF NEW DEVICES · ${n}/${w.devices.count}</p>
+        <div class="row">${tag("{{NO}} / BRANDS")}${glyph("sq2")}</div>
+        <p class="lead">Whatever the brand</p>
+        <div class="big"><span data-count="${b.count}">0</span><sup>BRANDS</sup></div>
+        <p class="mono sm dim">ONE HOME · ALL YOUR DEVICES</p>
+        ${maker ? spec([
+          ["TOP BRAND THIS YEAR", esc(maker), true],
+          ["ITS NEW DEVICES", `${n}/${w.devices.count} · ${Math.round((n / w.devices.count) * 100)}%`],
+        ]) : ""}
+        <div class="chips">${b.names.map((n, i) => `<span style="--i:${i}"><em>${pad(i + 1)}</em>${esc(n)}</span>`).join("")}
+          ${b.count > b.names.length ? `<span class="more">+${b.count - b.names.length}</span>` : ""}</div>`,
+    });
+  }
+
+  if (w.esphome?.diy) {
+    const e = w.esphome;
+    const thisYear = e.diyNew > 0;
+    s.push({
+      key: "ESPHOME",
+      ghost: "BUILT",
+      html: `
+        <div class="row">${tag("{{NO}} / MADE BY YOU")}${glyph("chip")}</div>
+        <p class="lead">${thisYear ? "Built by you with ESPHome this year" : "Built by you with ESPHome"}</p>
+        <div class="big"><span data-count="${thisYear ? e.diyNew : e.diy}">0</span><sup>DIY</sup></div>
+        <div class="chips">${e.names.map((n, i) => `<span style="--i:${i}"><em>${pad(i + 1)}</em>${esc(n)}</span>`).join("")}</div>
         ${spec([
-          ["MANUFACTURERS", `${w.devices.makers}`],
-          w.devices.room && ["MOST LOVED ROOM", esc(w.devices.room[0]), true],
-          w.devices.room && ["NEW DEVICES THERE", `${w.devices.room[1]}`],
+          thisYear && ["BUILT BY YOU, ALL TIME", `${e.diy}`],
+          e.ready && ["READY-MADE ESPHOME DEVICES", `${e.ready}`],
         ])}`,
+    });
+  }
+
+  if (w.automations?.count) {
+    const a = w.automations;
+    s.push({
+      key: "AUTOMATIONS",
+      ghost: "TRICKS",
+      html: `
+        <div class="row">${tag("{{NO}} / AUTOMATIONS")}${glyph("gear")}</div>
+        <p class="lead">New tricks you taught your home</p>
+        <div class="big"><span data-count="${a.count}">0</span><sup>NEW</sup></div>
+        ${spec([
+          ["AUTOMATIONS IN TOTAL", `${a.total}`],
+          w.blueprints != null && ["FROM A BLUEPRINT", `${w.blueprints}`],
+          a.oldest && ["OLDEST STILL AROUND", esc(a.oldest.name), true],
+          a.oldest && ["WRITTEN IN", `${new Date(a.oldest.date * 1000).getFullYear()}`],
+        ])}
+        ${ticks(a.byMonth, MON, { caption: "CREATED / MONTH", titles: MONTH3 })}`,
     });
   }
 
@@ -526,7 +637,7 @@ function buildSlides(w) {
       key: "APPS",
       ghost: "APPS",
       html: `
-        <div class="row">${tag("05 / APPS")}${glyph("grid")}</div>
+        <div class="row">${tag("{{NO}} / APPS")}${glyph("grid")}</div>
         <p class="lead">Apps installed on your server</p>
         <div class="big"><span data-count="${w.apps.count}">0</span><sup>APP</sup></div>
         <div class="chips">${w.apps.names.map((a, i) => `<span style="--i:${i}"><em>${pad(i + 1)}</em>${esc(a)}</span>`).join("")}
@@ -543,7 +654,7 @@ function buildSlides(w) {
       key: "HABITS",
       ghost: owl ? "NIGHT" : weekend ? "WEEKEND" : "DAYTIME",
       html: `
-        <div class="row">${tag("06 / HABITS")}${glyph(owl ? "moon" : weekend ? "house" : "sun")}</div>
+        <div class="row">${tag("{{NO}} / HABITS")}${glyph(owl ? "moon" : weekend ? "house" : "sun")}</div>
         <p class="lead">Your tinkering style</p>
         <div class="name xl">${owl ? "Night Owl" : weekend ? "Weekend Warrior" : "Daytime Tinkerer"}</div>
         ${spec([
@@ -564,7 +675,7 @@ function buildSlides(w) {
       key: "ENERGY",
       ghost: "kWh",
       html: `
-        <div class="row">${tag("07 / ENERGY")}${glyph("bolt")}</div>
+        <div class="row">${tag("{{NO}} / ENERGY")}${glyph("bolt")}</div>
         <p class="lead">Used by your metered devices</p>
         <div class="big"><span data-count="${Math.round(e.total)}">0</span><sup>kWh</sup></div>
         ${spec([
@@ -577,6 +688,24 @@ function buildSlides(w) {
     });
   }
 
+  if (w.solar) {
+    const p = w.solar;
+    s.push({
+      key: "SOLAR",
+      ghost: "SUN",
+      html: `
+        <div class="row">${tag("{{NO}} / SOLAR")}${glyph("sun")}</div>
+        <p class="lead">Made by your solar panels</p>
+        <div class="big"><span data-count="${Math.round(p.total)}">0</span><sup>kWh</sup></div>
+        ${spec([
+          ["USED AT HOME", `${Math.round(p.selfShare * 100)}%`, true],
+          ["SENT TO THE GRID", `${num(p.returned)} kWh`],
+          ["SUNNIEST MONTH", MONTH3[p.peakMonth]],
+        ])}
+        ${ticks(p.monthly, MON, { caption: "kWh / MONTH", dp: 1, unit: " kWh", titles: MONTH3 })}`,
+    });
+  }
+
   if (w.climate?.hottest) {
     const c = w.climate;
     const rooms = c.rooms.slice(0, 5);
@@ -586,7 +715,7 @@ function buildSlides(w) {
       key: "CLIMATE",
       ghost: `${Math.round(c.hottest.max)}°`,
       html: `
-        <div class="row">${tag("08 / CLIMATE")}${glyph("thermo")}</div>
+        <div class="row">${tag("{{NO}} / CLIMATE")}${glyph("thermo")}</div>
         <p class="lead">Warmest moment indoors</p>
         <div class="big"><span data-count="${c.hottest.max}" data-dp="1">0</span><sup>${c.unit}</sup></div>
         ${spec([
@@ -606,7 +735,7 @@ function buildSlides(w) {
     key: "INVENTORY",
     ghost: "INVENTORY",
     html: `
-      <div class="row">${tag("09 / INVENTORY")}${glyph("house")}</div>
+      <div class="row">${tag("{{NO}} / INVENTORY")}${glyph("house")}</div>
       <p class="lead">Your home today</p>
       <div class="cells">
         ${[["grid", n.entities, "ENTITIES"], ["gear", n.automations, "AUTOMATIONS"], ["nodes", w.devices.total, "DEVICES"],
@@ -616,12 +745,12 @@ function buildSlides(w) {
   });
 
   const arch = w.archetype;
-  const archGlyph = { "The Maker": "wrench", "The Mesh Master": "nodes", "The Climate Commander": "thermo", "The DJ": "wave", "The Automator": "gear" }[arch.name] || "cross";
+  const archGlyph = { "The Maker": "chip", "The Mesh Master": "nodes", "The Climate Commander": "thermo", "The DJ": "wave", "The Automator": "gear" }[arch.name] || "cross";
   s.push({
     key: "CLASS",
     ghost: arch.name.replace(/^The /, "").toUpperCase(),
     html: `
-      <div class="row">${tag("10 / CLASSIFICATION")}${tag("VERIFIED", "blue")}</div>
+      <div class="row">${tag("{{NO}} / CLASSIFICATION")}${tag("VERIFIED", "blue")}</div>
       <div class="seal"><i></i>${glyph(archGlyph, "xl")}</div>
       <p class="mono sm dim">YOUR HOME PERSONALITY</p>
       <h1 class="title">${esc(arch.name)}</h1>
@@ -635,7 +764,7 @@ function buildSlides(w) {
     ghost: "",
     html: `
       <div class="sticker">
-        <div class="st-hd">${glyph("house", "st-logo")}<div><b>HOME ASSISTANT</b><span>WRAPPED · ${w.year}</span></div><em>©${w.year}</em></div>
+        <div class="st-hd"><img class="st-logo" src="${HA_LOGO}" alt="Home Assistant"><div class="st-meta"><span>UNWRAPPED · ${w.year}</span><em>©${w.year}</em></div></div>
         <div class="st-io">
           <div><span>INPUT</span><b>${w.integrations.count} INTEGRATIONS · ${w.devices.count} DEVICES</b></div>
           <div><span>OUTPUT</span><b>${n.automations} AUTOMATIONS</b></div>
@@ -654,6 +783,7 @@ function buildSlides(w) {
       <p class="mono sm dim center">SCREENSHOT TO SHARE ↗</p>`,
   });
 
+  s.forEach((x, i) => { x.html = x.html.replace("{{NO}}", pad(i)); });
   return s;
 }
 
@@ -708,6 +838,8 @@ const STORY_CSS = `
 .hd, .ft { display: flex; align-items: center; gap: 8px; font: 500 9.5px var(--mono); letter-spacing: .12em; color: var(--dim); text-transform: uppercase; }
 .hd .rule, .ft .rule { flex: 1; height: 1px; background: var(--hair); }
 .hd { padding-right: 52px; }
+.hd span { white-space: nowrap; }
+.hd .rule { min-width: 6px; }
 .ft { margin-top: 10px; }
 .ft .g { width: 14px; height: 14px; color: var(--dim); }
 .body { flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 1.6cqh; min-height: 0; }
@@ -727,7 +859,7 @@ const STORY_CSS = `
 .tag { font: 500 10px var(--mono); letter-spacing: .12em; color: var(--ink); white-space: nowrap; }
 .tag.blue { color: var(--ha-blue); }
 .lead { margin: 1cqh 0 0; font: 500 4.6cqw/1.2 var(--sans); color: var(--dim); }
-.hero { margin: 0; font: 900 21cqw/.85 var(--sans); letter-spacing: -.055em; color: var(--ha-white); }
+.hero { margin: 0; font: 900 17cqw/.85 var(--sans); letter-spacing: -.055em; color: var(--ha-white); }
 .yr { display: flex; align-items: center; justify-content: space-between; font: 700 15cqw/1 var(--mono); letter-spacing: -.02em;
   color: transparent; -webkit-text-stroke: 1px var(--ha-blue); }
 .yr .g.lg { width: 13cqw; height: 13cqw; color: var(--ha-blue); stroke-width: .9; }
@@ -779,6 +911,7 @@ const STORY_CSS = `
   border-bottom: 1px solid var(--hair); animation: rise .45s both; animation-delay: calc(.3s + var(--i) * .06s); }
 .rank .idx { font: 500 9.5px var(--mono); color: var(--ha-blue); }
 .rank .lbl { font: 600 4cqw/1.2 var(--sans); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.rank .lbl small { font: 400 3.2cqw "Instrument Sans", var(--sans); font-stretch: 99%; color: var(--ink); }
 .rank b { font: 700 13px var(--mono); }
 .rank .bar { grid-column: 2 / 4; height: 2px; margin-top: 5px; background: var(--faint); }
 .rank .bar i { display: block; height: 100%; width: var(--w); background: var(--ha-blue); transform-origin: left; animation: growX .8s both .5s; }
@@ -795,16 +928,7 @@ const STORY_CSS = `
 .chips em { font-style: normal; color: var(--ha-blue); }
 .chips .more { color: var(--ha-blue); border-color: var(--ha-blue); }
 
-/* label stickers */
-.label { border: 1px solid var(--hair); padding: 10px 12px; background: rgba(29,33,38,.55); backdrop-filter: blur(2px); }
-.label.hi { border-color: var(--ha-blue); }
-.label-hd { display: flex; justify-content: space-between; font: 500 9.5px var(--mono); letter-spacing: .12em; color: var(--dim); margin-bottom: 8px; }
-.label.hi .label-hd span:first-child { color: var(--ha-blue); }
-.label-ft { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-top: 8px; }
-.label-ft .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .barcode { width: 30%; min-width: 70px; height: 18px; fill: var(--ink); flex: none; }
-.leader { display: flex; align-items: center; gap: 8px; color: var(--ha-blue); }
-.leader span { flex: 1; height: 0; border-top: 1px dashed rgba(24,188,242,.6); }
 
 /* climate ranges */
 .ranges { margin: 0; border-top: 1px solid var(--hair); }
@@ -848,12 +972,12 @@ const STORY_CSS = `
 
 /* summary sticker */
 .sticker { border: 1px solid var(--ha-white); background: rgba(29,33,38,.82); padding: 14px; display: flex; flex-direction: column; gap: 12px; }
-.st-hd { display: flex; align-items: center; gap: 10px; }
-.st-hd .st-logo { width: 30px; height: 30px; color: var(--ha-blue); stroke-width: 1.6; }
-.st-hd div { display: flex; flex-direction: column; flex: 1; }
-.st-hd b { font: 800 5.4cqw/1 var(--sans); letter-spacing: -.01em; color: var(--ha-white); }
-.st-hd span { font: 500 9.5px var(--mono); letter-spacing: .14em; color: var(--ha-blue); margin-top: 3px; }
-.st-hd em { font: 500 10px var(--mono); font-style: normal; color: var(--dim); align-self: flex-start; }
+/* Logo: clearspace of 1/3 of its height on every side (logo rules) */
+.st-hd { display: flex; flex-direction: column; gap: 0; }
+.st-hd .st-logo { display: block; width: 62%; height: auto; aspect-ratio: 1721 / 240; margin: 0 0 calc(62% * 240 / 1721 / 3); }
+.st-meta { display: flex; justify-content: space-between; align-items: baseline; }
+.st-meta span { font: 500 9.5px var(--mono); letter-spacing: .14em; color: var(--ha-blue); }
+.st-meta em { font: 500 10px var(--mono); font-style: normal; color: var(--dim); }
 .st-io { border: 1px solid var(--hair); background: rgba(242,244,249,.06); }
 .st-io div { display: flex; gap: 10px; padding: 6px 8px; font: 500 10px var(--mono); letter-spacing: .06em; }
 .st-io div + div { border-top: 1px solid var(--hair); }
@@ -940,7 +1064,7 @@ class HaWrappedStory extends HTMLElement {
     this.idx = i;
     this.show();
   }
-  sheetNo() { return `SHEET ${pad(this.idx + 1)}/${this.final ? pad(this.slides.length) : "··"}`; }
+  sheetNo() { return `${pad(this.idx + 1)}/${this.final ? pad(this.slides.length) : "··"}`; }
   updateProgress() {
     this.shadowRoot.querySelectorAll(".progress i").forEach((el, i) => {
       el.className = i < this.idx ? "done" : i === this.idx ? "cur" : "";
@@ -952,9 +1076,9 @@ class HaWrappedStory extends HTMLElement {
     this.holder.innerHTML = `<section class="slide">
       ${sheets(this.idx + 1, s.ghost)}
       <div class="content">
-        <header class="hd"><span>HA/WRAPPED</span><span class="rule"></span><span class="sheetno">${this.sheetNo()}</span></header>
+        <header class="hd"><span>HOME ASSISTANT UNWRAPPED</span><span class="rule"></span><span class="sheetno">${this.sheetNo()}</span></header>
         <div class="body">${s.html}</div>
-        <footer class="ft"><span>DWG HA-${yy}-${pad(this.idx + 1)}</span><span class="rule"></span><span>${esc(s.key)}</span>${glyph("cross")}</footer>
+        <footer class="ft"><span>DWG ${yy}-${pad(this.idx + 1)}</span><span class="rule"></span><span>${esc(s.key)}</span>${glyph("cross")}</footer>
       </div>
     </section>`;
     this.updateProgress();
@@ -1005,7 +1129,7 @@ class HaWrappedCard extends HTMLElement {
   // (registries, quick) and `_full` (plus a year of statistics, slow).
   prefetch() {
     if (this._full) return this._full;
-    const key = `ha-wrapped:v2:${this.year}`;
+    const key = `ha-wrapped:v3:${this.year}`;
     try {
       const cached = JSON.parse(localStorage.getItem(key) || "null");
       if (cached && Date.now() - cached.at < CACHE_MS) {
@@ -1053,11 +1177,11 @@ class HaWrappedCard extends HTMLElement {
         .err { color: #ffb4a8; font: 500 11px var(--mono); }
       </style>
       <ha-card><div class="in">
-        <div class="top"><span>[ HA/WRAPPED ]</span><span class="rule"></span><span class="ref">REF.${this.year}</span></div>
-        <div class="h">Wrapped <span class="yr">${this.year}</span></div>
-        <div class="s">YOUR YEAR IN SMART HOME — TAP THROUGH</div>
+        <div class="top"><span>[ HOME ASSISTANT ]</span><span class="rule"></span><span class="ref">REF.${this.year}</span></div>
+        <div class="h">Unwrapped <span class="yr">${this.year}</span></div>
+        <div class="s">YOUR HOME'S YEAR, ONE TAP AT A TIME</div>
         <div class="err" hidden></div>
-        <div class="bottom">${barcode(`wrapped${this.year}`, 60).replace('class="barcode"', 'class="bar"')}<button aria-label="Play">▶ PLAY</button></div>
+        <div class="bottom">${barcode(`unwrapped${this.year}`, 60).replace('class="barcode"', 'class="bar"')}<button aria-label="Play">▶ PLAY</button></div>
       </div></ha-card>`;
     root.querySelector("ha-card").addEventListener("click", () => this.play());
   }
@@ -1081,7 +1205,7 @@ class HaWrappedCard extends HTMLElement {
     } catch (e) {
       console.error("ha-wrapped", e);
       story.close();
-      err.textContent = `Couldn't build your Wrapped: ${e.message || e.code || e}. (Admin user required.)`;
+      err.textContent = `Couldn't build your Unwrapped: ${e.message || e.code || e}. (Admin user required.)`;
       err.hidden = false;
     }
   }
@@ -1089,4 +1213,4 @@ class HaWrappedCard extends HTMLElement {
 if (!customElements.get("ha-wrapped-card")) customElements.define("ha-wrapped-card", HaWrappedCard);
 
 window.customCards = window.customCards || [];
-window.customCards.push({ type: "ha-wrapped-card", name: "Home Assistant Wrapped", description: "A tap-through year-in-review story for your smart home." });
+window.customCards.push({ type: "ha-wrapped-card", name: "Home Assistant Unwrapped", description: "A tap-through year-in-review story for your smart home." });
