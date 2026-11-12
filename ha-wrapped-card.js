@@ -75,6 +75,12 @@ async function collectWrapped(hass, year, onCore) {
   for (const e of entries) firstSeen[e.domain] = Math.min(firstSeen[e.domain] ?? Infinity, e.created_at || 0);
   const newDomains = [...new Set(integrationsNew.map((e) => e.domain))].filter((d) => inYear(firstSeen[d]));
 
+  const countBy = (arr, key) => {
+    const m = new Map();
+    for (const x of arr) { const k = key(x); if (k) m.set(k, (m.get(k) || 0) + 1); }
+    return [...m.entries()].sort((a, b) => b[1] - a[1]);
+  };
+
   // Where each integration runs, from its manifest's iot_class (all integrations
   // set up today, helpers left out)
   const iotClass = Object.fromEntries(manifests.map((m) => [m.domain, m.iot_class || ""]));
@@ -84,6 +90,11 @@ async function collectWrapped(hass, year, onCore) {
     const c = iotClass[e.domain] || "";
     reach[c.startsWith("local") ? "local" : c.startsWith("cloud") ? "cloud" : "other"]++;
   }
+  // The cloud ones by name, most entries first
+  const cloudDomains = countBy(userEntries.filter((e) => !HELPER_DOMAINS.has(e.domain)
+    && (iotClass[e.domain] || "").startsWith("cloud")), (e) => e.domain);
+  reach.cloudNames = cloudDomains.slice(0, 5).map(([d]) => nameOf(d));
+  reach.cloudKinds = cloudDomains.length;
 
   // ---- devices
   const domainOfDevice = (d) => {
@@ -96,11 +107,6 @@ async function collectWrapped(hass, year, onCore) {
   const newDevices = things.filter((d) => inYear(d.created_at)).sort((a, b) => a.created_at - b.created_at);
   const newApps = apps.filter((d) => inYear(d.created_at));
 
-  const countBy = (arr, key) => {
-    const m = new Map();
-    for (const x of arr) { const k = key(x); if (k) m.set(k, (m.get(k) || 0) + 1); }
-    return [...m.entries()].sort((a, b) => b[1] - a[1]);
-  };
   const topDomains = countBy(newDevices, domainOfDevice).map(([d, n]) => [nameOf(d), n, d]);
   const makerOf = (d) => {
     const m = (d.manufacturer || "").trim();
@@ -550,7 +556,10 @@ function buildSlides(w) {
           ["RUN LOCALLY", `${r.local}`, true],
           ["USE THE CLOUD", `${r.cloud}`],
           r.other && ["OTHER", `${r.other}`],
-        ])}`,
+        ])}
+        ${r.cloudNames?.length ? `<p class="mono sm dim">USING THE CLOUD</p>
+        <div class="chips">${r.cloudNames.map((n, i) => `<span style="--i:${i}"><em>${pad(i + 1)}</em>${esc(n)}</span>`).join("")}
+          ${r.cloudKinds > r.cloudNames.length ? `<span class="more">+${r.cloudKinds - r.cloudNames.length}</span>` : ""}</div>` : ""}`,
     });
   }
 
