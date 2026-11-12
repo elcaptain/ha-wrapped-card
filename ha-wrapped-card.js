@@ -10,7 +10,7 @@
  * Needs an admin user (registry + recorder websocket commands).
  */
 
-const VERSION = "1.3.0";
+const VERSION = "1.3.1";
 console.info(`%c HOME ASSISTANT UNWRAPPED %c v${VERSION} `, "color:#1d2126;background:#18bcf2;font-weight:700", "color:#18bcf2;background:#1d2126");
 
 const HELPER_DOMAINS = new Set([
