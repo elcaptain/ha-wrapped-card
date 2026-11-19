@@ -886,9 +886,12 @@ const STORY_CSS = `
 .progress i { flex: 1; height: 2px; background: var(--faint); transition: background .3s; }
 .progress i.done { background: var(--ha-white); }
 .progress i.cur { background: var(--ha-blue); }
-.close { position: absolute; top: 22px; right: 12px; z-index: 6; background: none; border: 0; color: var(--dim); cursor: pointer;
-  font: 500 10px var(--mono); letter-spacing: .12em; padding: 6px; }
-.close:hover { color: var(--ink); }
+.close { position: absolute; top: 20px; right: 12px; z-index: 6; display: flex; align-items: center; gap: 6px; cursor: pointer;
+  background: rgba(29,33,38,.82); border: 1px solid var(--hair); border-radius: 999px; color: var(--ink);
+  font: 600 10.5px var(--mono); letter-spacing: .12em; padding: 6px 8px 6px 11px; -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px);
+  transition: background .2s, border-color .2s; }
+.close b { font: 400 17px/1 var(--sans); margin-top: -2px; }
+.close:hover, .close:focus-visible { background: var(--ha-blue); border-color: var(--ha-blue); color: var(--ha-black); outline: none; }
 .tapL, .tapR { position: absolute; top: 44px; bottom: 0; z-index: 4; cursor: pointer; }
 .tapL { left: 0; width: 30%; } .tapR { right: 0; width: 70%; }
 
@@ -896,7 +899,7 @@ const STORY_CSS = `
 .content { position: absolute; inset: 0; z-index: 2; display: flex; flex-direction: column; padding: 30px 6.5cqw 16px; box-sizing: border-box; }
 .hd, .ft { display: flex; align-items: center; gap: 8px; font: 500 9.5px var(--mono); letter-spacing: .12em; color: var(--dim); text-transform: uppercase; }
 .hd .rule, .ft .rule { flex: 1; height: 1px; background: var(--hair); }
-.hd { padding-right: 52px; }
+.hd { padding-right: 78px; }
 .hd span { white-space: nowrap; }
 .hd .rule { min-width: 6px; }
 .ft { margin-top: 10px; }
@@ -1075,7 +1078,7 @@ class HaWrappedStory extends HTMLElement {
     root.innerHTML = `<style>${STORY_CSS}</style>
       <div class="wrap"><div class="stage">
         <div class="progress">${slides.map(() => "<i></i>").join("")}</div>
-        <button class="close" aria-label="Close">ESC ×</button>
+        <button class="close" aria-label="Close">ESC <b aria-hidden="true">&times;</b></button>
         <div class="holder"></div>
         <div class="tapL"></div><div class="tapR"></div>
       </div></div>`;
@@ -1119,7 +1122,11 @@ class HaWrappedStory extends HTMLElement {
   // Slides only change on tap, click or arrow key; there is no auto-advance.
   go(i) {
     if (i < 0) i = 0;
-    if (i >= this.slides.length) { this._wantNext = !this.final; return; } // still loading, or on summary
+    if (i >= this.slides.length) {
+      if (this.final) this.close(); // past the summary: done
+      else this._wantNext = true; // still loading, move on when slides arrive
+      return;
+    }
     this.idx = i;
     this.show();
   }
