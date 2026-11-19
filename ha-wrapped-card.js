@@ -189,13 +189,23 @@ async function collectWrapped(hass, year, onCore) {
         .filter((id) => id && (entityById[id] || hass.states[id]));
       const returnIds = sources.filter((x) => x.type === "grid")
         .flatMap((g) => [...(g.flow_to || []).map((f) => f.stat_energy_to), g.stat_energy_to]).filter(Boolean);
+      // What the house used, and the devices the user picked, from the same settings.
+      // Grid sources come in two shapes: flow_from/flow_to lists, or the sensor ids directly.
+      const exists = (id) => id && (entityById[id] || hass.states[id]);
+      const gridIds = sources.filter((x) => x.type === "grid")
+        .flatMap((g) => [...(g.flow_from || []).map((f) => f.stat_energy_from), g.stat_energy_from]).filter(exists);
+      const batteries = sources.filter((x) => x.type === "battery");
+      const batteryOutIds = batteries.map((b) => b.stat_energy_from).filter(exists);
+      const batteryInIds = batteries.map((b) => b.stat_energy_to).filter(exists);
+      const devicePrefs = (prefs?.device_consumption || []).filter((d) => exists(d.stat_consumption));
+      const deviceIds = devicePrefs.map((d) => d.stat_consumption);
       const unitOf = (id) => statIds.find((x) => x.statistic_id === id)?.statistics_unit_of_measurement;
       const kwhFactor = (id) => ({ Wh: 0.001, MWh: 1000, GJ: 277.778 }[unitOf(id)] ?? 1);
 
       const [eStats, tStats, xStats] = await Promise.all([
         period(energyIds, ["change"]),
         period(tempIds, ["mean", "min", "max"]),
-        period([...new Set([...solarIds, ...returnIds])], ["change"]),
+        period([...new Set([...solarIds, ...returnIds, ...gridIds, ...batteryOutIds, ...batteryInIds, ...deviceIds])], ["change"]),
       ]);
       const monthsOf = (ids, factor = () => 1) => {
         const m = Array(12).fill(0);
@@ -220,25 +230,63 @@ async function collectWrapped(hass, year, onCore) {
         blueprints = cfgs.filter((c) => c?.use_blueprint).length;
       }
 
-      // Energy: one total per device (devices often expose several energy sensors)
-      const perDevice = new Map();
-      const monthly = Array(12).fill(0);
-      for (const [id, rows] of Object.entries(eStats)) {
-        const unit = energyIds.find((s) => s.statistic_id === id)?.statistics_unit_of_measurement;
-        const k = unit === "Wh" ? 0.001 : unit === "MWh" ? 1000 : 1;
-        const months = Array(12).fill(0);
-        rows.forEach((r) => { months[new Date(r.start).getMonth()] += Math.max(0, r.change || 0) * k; });
-        const total = months.reduce((a, b) => a + b, 0);
-        const devKey = entityById[id]?.device_id || id;
-        const prev = perDevice.get(devKey);
-        if (!prev || total > prev.total) perDevice.set(devKey, { id, total, months });
+      // Energy. A meter and the devices behind it measure the same kWh, so the
+      // total and the consumers come from the Energy dashboard's settings when
+      // they exist, and adding up every energy sensor is only the fallback.
+      const byTotal = (a, b) => b.total - a.total;
+      let consumers;
+      let monthly = null;
+      let scope = "devices";
+      if (devicePrefs.length) {
+        // Devices the user picked. One that is part of another (included_in_stat)
+        // still ranks, but only the top-level ones add up to a total.
+        consumers = devicePrefs.map((d) => {
+          const months = monthsOf([d.stat_consumption], kwhFactor);
+          return { id: d.stat_consumption, name: d.name, total: sum(months), months, nested: !!d.included_in_stat };
+        }).filter((c) => c.total > 0.01).sort(byTotal);
+      } else {
+        // No devices picked: one total per device (devices often expose several
+        // energy sensors). Sensors without a device are mostly helpers (utility
+        // meters, integrals) that re-count another sensor, and the grid, solar
+        // and battery meters aren't consumers, so both are left out.
+        const sourceDevices = new Set([...gridIds, ...returnIds, ...solarIds, ...batteryOutIds, ...batteryInIds]
+          .map((id) => entityById[id]?.device_id).filter(Boolean));
+        const perDevice = new Map();
+        for (const [id, rows] of Object.entries(eStats)) {
+          const devKey = entityById[id]?.device_id;
+          if (!devKey || sourceDevices.has(devKey)) continue;
+          const k = kwhFactor(id);
+          const months = Array(12).fill(0);
+          rows.forEach((r) => { months[new Date(r.start).getMonth()] += Math.max(0, r.change || 0) * k; });
+          const total = sum(months);
+          const prev = perDevice.get(devKey);
+          if (!prev || total > prev.total) perDevice.set(devKey, { id, total, months });
+        }
+        consumers = [...perDevice.values()].filter((c) => c.total > 0.01).sort(byTotal);
       }
-      const consumers = [...perDevice.values()].filter((c) => c.total > 0.01).sort((a, b) => b.total - a.total);
-      if (consumers.length) {
-        consumers.forEach((c) => c.months.forEach((v, i) => { monthly[i] += v; }));
+      if (gridIds.length) {
+        // What the house used: from the grid, plus solar and battery, minus what went out
+        const add = (ids, sign) => monthsOf(ids, kwhFactor).forEach((v, i) => { monthly[i] += sign * v; });
+        monthly = Array(12).fill(0);
+        add(gridIds, 1);
+        add(solarIds, 1);
+        add(returnIds, -1);
+        add(batteryOutIds, 1);
+        add(batteryInIds, -1);
+        monthly = monthly.map((v) => Math.max(0, v));
+        if (sum(monthly) > 0.5) scope = "home";
+        else monthly = null;
+      }
+      if (!monthly && consumers.length) {
+        monthly = Array(12).fill(0);
+        consumers.filter((c) => !c.nested).forEach((c) => c.months.forEach((v, i) => { monthly[i] += v; }));
+      }
+      const total = monthly ? sum(monthly) : 0;
+      if (total > 0.01) {
         energy = {
-          total: consumers.reduce((a, c) => a + c.total, 0),
-          top: consumers.slice(0, 4).map((c) => ({ name: friendly(c.id), kwh: c.total })),
+          total,
+          scope,
+          top: consumers.slice(0, 4).map((c) => ({ name: c.name || friendly(c.id), kwh: c.total })),
           monthly,
           peakMonth: monthly.indexOf(Math.max(...monthly)),
           count: consumers.length,
@@ -685,13 +733,15 @@ function buildSlides(w) {
       ghost: "kWh",
       html: `
         <div class="row">${tag("{{NO}} / ENERGY")}${glyph("bolt")}</div>
-        <p class="lead">Used by your metered devices</p>
+        <p class="lead">${e.scope === "home" ? "Used by your home" : "Used by your metered devices"}</p>
         <div class="big"><span data-count="${Math.round(e.total)}">0</span><sup>kWh</sup></div>
         ${spec([
-          ["TOP CONSUMER", esc(e.top[0].name), true],
-          ["ITS SHARE", `${Math.round((e.top[0].kwh / e.total) * 100)}% · ${num(e.top[0].kwh, 1)} kWh`],
+          ...(e.top.length ? [
+            ["TOP CONSUMER", esc(e.top[0].name), true],
+            ["ITS SHARE", `${Math.min(100, Math.round((e.top[0].kwh / e.total) * 100))}% · ${num(e.top[0].kwh, 1)} kWh`],
+          ] : []),
           ["HUNGRIEST MONTH", MONTH3[e.peakMonth]],
-          ["METERED DEVICES", `${e.count}`],
+          ...(e.count ? [["METERED DEVICES", `${e.count}`]] : []),
         ])}
         ${ticks(e.monthly, MON, { caption: "kWh / MONTH", dp: 1, unit: " kWh", titles: MONTH3 })}`,
     });
