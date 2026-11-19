@@ -64,6 +64,14 @@ async function collectWrapped(hass, year, onCore) {
 
   // Integration display names
   const names = Object.fromEntries(manifests.map((m) => [m.domain, m.name]));
+  // Integrations that talk to your own hardware (type device or hub; hub is the
+  // default when a manifest doesn't say). Services like weather or text-to-speech
+  // aren't something you can bring home, so they stay out of the local score
+  // and the device counts.
+  const typeOf = Object.fromEntries(manifests.map((m) => [m.domain, m.integration_type || "hub"]));
+  // MQTT calls itself a service, but it's the bridge to Zigbee2MQTT, Tasmota and
+  // other devices, so it counts as a hub here.
+  const isHardware = (domain) => !manifests.length || domain === "mqtt" || ["device", "hub"].includes(typeOf[domain] ?? "hub");
   const nameOf = (d) => names[d] || d.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
   // ---- integrations
@@ -85,14 +93,13 @@ async function collectWrapped(hass, year, onCore) {
   // set up today, helpers left out)
   const iotClass = Object.fromEntries(manifests.map((m) => [m.domain, m.iot_class || ""]));
   const reach = { local: 0, cloud: 0, other: 0 };
-  for (const e of userEntries) {
-    if (HELPER_DOMAINS.has(e.domain)) continue;
+  const hardwareEntries = userEntries.filter((e) => !HELPER_DOMAINS.has(e.domain) && isHardware(e.domain));
+  for (const e of hardwareEntries) {
     const c = iotClass[e.domain] || "";
     reach[c.startsWith("local") ? "local" : c.startsWith("cloud") ? "cloud" : "other"]++;
   }
   // The cloud ones by name, most entries first
-  const cloudDomains = countBy(userEntries.filter((e) => !HELPER_DOMAINS.has(e.domain)
-    && (iotClass[e.domain] || "").startsWith("cloud")), (e) => e.domain);
+  const cloudDomains = countBy(hardwareEntries.filter((e) => (iotClass[e.domain] || "").startsWith("cloud")), (e) => e.domain);
   reach.cloudNames = cloudDomains.slice(0, 5).map(([d]) => nameOf(d));
   reach.cloudKinds = cloudDomains.length;
 
@@ -103,7 +110,8 @@ async function collectWrapped(hass, year, onCore) {
   };
   const realDevices = devices.filter((d) => d.entry_type !== "service" && !STORE_DOMAINS.has(domainOfDevice(d)));
   const apps = realDevices.filter((d) => domainOfDevice(d) === "hassio" && d.model === "Home Assistant App");
-  const things = realDevices.filter((d) => domainOfDevice(d) !== "hassio");
+  const fromHardware = (d) => (d.config_entries || []).some((id) => entryById[id] && isHardware(entryById[id].domain));
+  const things = realDevices.filter((d) => domainOfDevice(d) !== "hassio" && fromHardware(d));
   const newDevices = things.filter((d) => inYear(d.created_at)).sort((a, b) => a.created_at - b.created_at);
   const newApps = apps.filter((d) => inYear(d.created_at));
 
@@ -172,8 +180,16 @@ async function collectWrapped(hass, year, onCore) {
       const sensorStat = (s) => s.statistic_id.startsWith("sensor.");
       const energyIds = statIds.filter((s) => sensorStat(s) && s.has_sum && s.unit_class === "energy"
         && !/returned|export|production|solar|feed_in/i.test(s.statistic_id));
-      const tempIds = statIds.filter((s) => sensorStat(s) && s.has_mean && s.unit_class === "temperature"
-        && !/nozzle|bed_temp|cpu|chip|wash|water|forecast|feeling|dew|_target|setpoint/i.test(s.statistic_id));
+      const tempStats = statIds.filter((s) => sensorStat(s) && s.has_mean && s.unit_class === "temperature");
+      // Rooms use the temperature sensor picked for each area (Settings > Areas).
+      // Homes without any fall back to guessing from every temperature sensor.
+      const areaTemp = new Map(areas.filter((a) => a.temperature_entity_id)
+        .map((a) => [a.temperature_entity_id, a.name])
+        .filter(([id]) => tempStats.some((s) => s.statistic_id === id)));
+      const isOutsideId = (id) => WEATHER_PLATFORMS.has(entityById[id]?.platform) || /outside|outdoor|exterior/i.test(id);
+      const tempIds = areaTemp.size
+        ? [...areaTemp.keys(), ...tempStats.map((s) => s.statistic_id).filter((id) => !areaTemp.has(id) && isOutsideId(id))]
+        : tempStats.filter((s) => !/nozzle|bed_temp|cpu|chip|wash|water|forecast|feeling|dew|_target|setpoint/i.test(s.statistic_id));
 
       const period = (ids, types) => ids.length ? hass.callWS({
         type: "recorder/statistics_during_period",
@@ -282,6 +298,13 @@ async function collectWrapped(hass, year, onCore) {
         consumers.filter((c) => !c.nested).forEach((c) => c.months.forEach((v, i) => { monthly[i] += v; }));
       }
       const total = monthly ? sum(monthly) : 0;
+      // How much of what the home used the picked devices account for. Devices
+      // inside another one (included_in_stat) are already in their parent.
+      let tracked = null;
+      if (scope === "home" && devicePrefs.length) {
+        const kwh = sum(consumers.filter((c) => !c.nested).map((c) => c.total));
+        tracked = { kwh: Math.min(kwh, total), share: Math.min(1, kwh / total), devices: consumers.length };
+      }
       if (total > 0.01) {
         energy = {
           total,
@@ -290,6 +313,7 @@ async function collectWrapped(hass, year, onCore) {
           monthly,
           peakMonth: monthly.indexOf(Math.max(...monthly)),
           count: consumers.length,
+          tracked,
         };
       }
 
@@ -301,16 +325,14 @@ async function collectWrapped(hass, year, onCore) {
         const max = Math.max(...rows.map((r) => r.max ?? -Infinity));
         const min = Math.min(...rows.map((r) => r.min ?? Infinity));
         const mean = rows.reduce((a, r) => a + (r.mean ?? 0), 0) / rows.length;
-        const platform = entityById[id]?.platform;
-        const isOutside = WEATHER_PLATFORMS.has(platform) || /outside|outdoor|exterior/i.test(id);
-        if (isOutside) {
+        if (!areaTemp.has(id) && isOutsideId(id)) {
           if (!outside || max > outside.max) {
             const hot = rows.reduce((a, r) => (r.max > a.max ? r : a));
             outside = { max, min, month: new Date(hot.start).getMonth() };
           }
           continue;
         }
-        const room = areaOfEntity(id);
+        const room = areaTemp.size ? areaTemp.get(id) : areaOfEntity(id);
         if (room) rooms.push({ room, max, min, mean });
       }
       // Keep the warmest sensor per room
@@ -358,6 +380,7 @@ async function collectWrapped(hass, year, onCore) {
 
   const core = {
     year, tz,
+    home: hass.config?.location_name || "",
     integrations: {
       count: integrationsNew.length,
       domains: newDomains.length,
@@ -526,7 +549,7 @@ function sheets(seed, ghost) {
 
 /* --------------------------------------------------------------- slides -- */
 
-function introSlide(year, loading = false) {
+function introSlide(year, loading = false, home = "") {
   return {
     key: "INTRO",
     ghost: String(year),
@@ -536,7 +559,7 @@ function introSlide(year, loading = false) {
       <h1 class="hero">Unwrapped<span class="blue">.</span></h1>
       <div class="yr"><span>${year}</span>${glyph("cross", "lg")}</div>
       ${spec([
-        ["SUBJECT", "YOUR HOME"],
+        ["SUBJECT", esc((home || "Your home").toUpperCase())],
         ["PERIOD", `01.01 — 31.12.${year}`],
         ["FORMAT", "TAP-THROUGH · SHEETS"],
       ])}
@@ -567,7 +590,7 @@ function readingsSlide(year) {
 function buildSlides(w) {
   const s = [];
 
-  s.push(introSlide(w.year));
+  s.push(introSlide(w.year, false, w.home));
 
   if (w.integrations.count) {
     const i = w.integrations;
@@ -744,6 +767,26 @@ function buildSlides(w) {
           ...(e.count ? [["METERED DEVICES", `${e.count}`]] : []),
         ])}
         ${ticks(e.monthly, MON, { caption: "kWh / MONTH", dp: 1, unit: " kWh", titles: MONTH3 })}`,
+    });
+  }
+
+  if (w.energy?.tracked) {
+    const t = w.energy.tracked;
+    const pct = Math.round(t.share * 100);
+    s.push({
+      key: "TRACKED",
+      ghost: "TRACKED",
+      html: `
+        <div class="row">${tag("{{NO}} / TRACKED")}${glyph("nodes")}</div>
+        <p class="lead">Traced back to your devices</p>
+        <div class="big"><span data-count="${pct}">0</span><sup>% TRACKED</sup></div>
+        ${pips(t.share)}
+        <p class="mono sm dim">SHARE OF YOUR HOME'S ENERGY YOUR DEVICES ACCOUNT FOR</p>
+        ${spec([
+          ["BY YOUR DEVICES", `${num(t.kwh)} kWh`, true],
+          ["NOT YET TRACKED", `${num(Math.max(0, w.energy.total - t.kwh))} kWh`],
+          ["TRACKED DEVICES", `${t.devices}`],
+        ])}`,
     });
   }
 
@@ -1195,7 +1238,7 @@ class HaWrappedCard extends HTMLElement {
   // (registries, quick) and `_full` (plus a year of statistics, slow).
   prefetch() {
     if (this._full) return this._full;
-    const key = `ha-wrapped:v3:${this.year}`;
+    const key = `ha-wrapped:v4:${this.year}`;
     try {
       const cached = JSON.parse(localStorage.getItem(key) || "null");
       if (cached && Date.now() - cached.at < CACHE_MS) {
@@ -1258,7 +1301,7 @@ class HaWrappedCard extends HTMLElement {
     // Open straight away on the intro; the rest of the deck slots in when ready.
     const story = document.createElement("ha-wrapped-story");
     document.body.appendChild(story);
-    story.open([introSlide(this.year, true)], this.year);
+    story.open([introSlide(this.year, true, this._hass?.config?.location_name)], this.year);
     try {
       const full = this.prefetch();
       // Show the quick slides first; energy and climate slot in when ready

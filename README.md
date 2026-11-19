@@ -4,23 +4,24 @@ A year-in-review story for your home. A dashboard card opens a full-screen, tap-
 
 ## Slides
 
-1. Intro
+1. Intro, with your home's name from Settings > General
 2. Integrations added this year, by month
-3. Local: the share of your integrations that run in your home, and up to five that use the cloud
-4. New devices, ranked by integration
+3. Local: the share of your device and hub integrations that run in your home, and up to five that use the cloud. Service integrations (weather, text-to-speech, …) are left out, since there's no local alternative to switch to
+4. New devices, ranked by integration (devices from device and hub integrations only)
 5. Brands: every manufacturer in your home, and this year's top brand
 6. Made by you: ESPHome devices you built yourself
 7. Automations created this year, how many came from a blueprint, and the oldest one still around
 8. Apps installed
 9. Tinkering habits (night owl, weekend warrior or daytime tinkerer)
 10. Energy: total kWh, hardest-working device, hungriest month
-11. Solar: what your panels made and the share used at home
-12. Climate: warmest indoor reading, outdoor peak, average per room
-13. Your home today: entities, automations, devices, areas
-14. Home personality (The Maker, The Mesh Master, The Automator, …)
-15. Shareable summary card
+11. Tracked: the share of your home's energy that the devices in the Energy dashboard account for
+12. Solar: what your panels made and the share used at home
+13. Climate: warmest indoor reading, outdoor peak, average per room, from the temperature sensor set for each area in Settings > Areas
+14. Your home today: entities, automations, devices, areas
+15. Home personality (The Maker, The Mesh Master, The Automator, …)
+16. Shareable summary card
 
-Slides without data are skipped. For example, the energy slide only appears if you have energy sensors with long-term statistics, and the solar slide only if a solar source is set up in the energy dashboard and produced energy this year.
+Slides without data are skipped. For example, the energy slide only appears if you have energy sensors with long-term statistics, the tracked slide only when the Energy dashboard has a grid source and individual devices, and the solar slide only if a solar source is set up in the energy dashboard and produced energy this year.
 
 ## Install
 
@@ -57,7 +58,7 @@ The card uses only built-in websocket commands, so no backend integration is nee
 | Integrations added | `config_entries/get` (`created_at`) |
 | Devices, brands, rooms | `config/device_registry/list`, `config/area_registry/list` |
 | Entity counts | `config/entity_registry/list` |
-| Integration names, local or cloud | `manifest/list` (`iot_class`) |
+| Integration names, local or cloud, device or service | `manifest/list` (`iot_class`, `integration_type`) |
 | Energy and temperature | `recorder/list_statistic_ids` and `recorder/statistics_during_period` (monthly) |
 | Solar and grid return | `energy/get_prefs`, then the same statistics |
 | Automations from a blueprint | `config/automation/config/<id>` (REST, for this year's automations, up to 50) |
@@ -70,7 +71,8 @@ Data collection starts in the background when the dashboard loads. The result is
 - The energy totals cover only devices with energy sensors. Several sensors on one device are counted once.
 - ESPHome devices are "made by you" unless the maker set an ESPHome project, which ready-made devices do. A DIY device with its own project set counts as ready-made.
 - Automation dates come from the ID the automation editor gives each automation, which is the moment it was created. Automations written in YAML with other IDs use the entity registry date, and aren't used for "oldest still around".
-- The temperature stats use monthly min/max values, so a sensor that reads high, for example one heated by its own chip, can win "warmest room".
+- The temperature stats use monthly min/max values, so a sensor that reads high, for example one heated by its own chip, can win "warmest room". If no area has a temperature sensor set in Settings > Areas, every temperature sensor with statistics is used instead.
+- MQTT counts as a hub, although its manifest calls it a service, because it's how Zigbee2MQTT, Tasmota and similar devices connect.
 
 ## License
 
