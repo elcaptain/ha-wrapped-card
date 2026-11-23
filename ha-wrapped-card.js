@@ -5,7 +5,10 @@
  * /config/www/ha-wrapped-card.js and add it as a dashboard resource
  * (/local/ha-wrapped-card.js, type: module). Then add a card:
  *   type: custom:ha-wrapped-card
- *   year: 2026   # optional, defaults to the current year
+ *   year: 2026          # optional; defaults to the year being reviewed
+ *   show_from: "12-01"  # optional; the card shows itself from this day...
+ *   show_until: "01-15" # ...until this day (inclusive), and hides the rest of the year
+ *   always_show: false  # optional; true shows it all year
  *
  * Needs an admin user (registry + recorder websocket commands).
  */
@@ -1218,16 +1221,65 @@ if (!customElements.get("ha-wrapped-story")) customElements.define("ha-wrapped-s
 
 /* ----------------------------------------------------------------- card -- */
 
+// "MM-DD" as a number (1 December = 1201), for comparing days in the year
+const monthDay = (d) => (d.getMonth() + 1) * 100 + d.getDate();
+function parseMonthDay(text, key) {
+  const m = /^(\d{1,2})-(\d{1,2})$/.exec(String(text).trim());
+  const month = m && +m[1];
+  const day = m && +m[2];
+  if (!m || month < 1 || month > 12 || day < 1 || day > 31) {
+    throw new Error(`${key} must be a day as "MM-DD", like "12-01"`);
+  }
+  return month * 100 + day;
+}
+
 class HaWrappedCard extends HTMLElement {
+  constructor() {
+    super();
+    // Stay attached while hidden, so the card can show itself again when its season starts
+    this.connectedWhileHidden = true;
+  }
   setConfig(config) {
     this.config = config || {};
-    this.year = +(this.config.year || new Date().getFullYear());
+    this.showFrom = parseMonthDay(this.config.show_from ?? "12-01", "show_from");
+    this.showUntil = parseMonthDay(this.config.show_until ?? "01-15", "show_until");
+    this.year = +(this.config.year || this.defaultYear(new Date()));
+    this.updateVisibility();
+  }
+  // In the part of the season after New Year, the year to review is the one that just ended
+  defaultYear(now) {
+    const wraps = this.showFrom > this.showUntil;
+    return wraps && monthDay(now) <= this.showUntil ? now.getFullYear() - 1 : now.getFullYear();
+  }
+  inSeason(now = new Date()) {
+    const md = monthDay(now);
+    return this.showFrom <= this.showUntil
+      ? md >= this.showFrom && md <= this.showUntil
+      : md >= this.showFrom || md <= this.showUntil;
+  }
+  // The dashboard editor sets `preview`; the card always shows there, so it can be found and edited
+  set preview(value) {
+    this._preview = !!value;
+    this.updateVisibility();
+  }
+  get preview() { return this._preview; }
+  set editMode(value) { this.preview = value; }
+  // Out of season the card hides itself; the dashboard then removes its spot entirely.
+  updateVisibility() {
+    if (!this.config) return;
+    const show = !!(this._preview || this.config.always_show || this.inSeason());
+    if (this.hidden === !show) return;
+    this.hidden = !show;
+    this.dispatchEvent(new CustomEvent("card-visibility-changed", { detail: { value: show }, bubbles: true, composed: true }));
   }
   set hass(hass) {
     this._hass = hass;
-    if (!this.rendered) {
-      this.render();
-      this.prefetch().catch(() => {}); // warm up in the background; errors surface on play
+    this.updateVisibility(); // hass updates often, so the card notices when its season starts
+    if (!this.rendered) this.render();
+    // Only gather data when the card can be seen, so it costs nothing the rest of the year
+    if (!this.hidden && !this._warmed) {
+      this._warmed = true;
+      this.prefetch().catch(() => {}); // errors surface on play
     }
   }
   getCardSize() { return 3; }
@@ -1322,4 +1374,5 @@ class HaWrappedCard extends HTMLElement {
 if (!customElements.get("ha-wrapped-card")) customElements.define("ha-wrapped-card", HaWrappedCard);
 
 window.customCards = window.customCards || [];
-window.customCards.push({ type: "ha-wrapped-card", name: "Home Assistant Unwrapped", description: "A tap-through year-in-review story for your smart home." });
+window.customCards.push({ type: "ha-wrapped-card", name: "Home Assistant Unwrapped",
+  description: "A tap-through year in review for your home. It shows itself from 1 December to 15 January and hides the rest of the year." });

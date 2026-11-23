@@ -42,10 +42,22 @@ Installing only adds the card; it doesn't create a dashboard. Add it to any dash
 
 ```yaml
 type: custom:ha-wrapped-card
-year: 2026 # optional, defaults to the current year
 ```
 
 A **panel** view gives the card a full-width spot of its own.
+
+### When it shows
+
+The card shows itself from **1 December to 15 January** and hides the rest of the year, so it can stay on a dashboard all year. Outside that window it takes no space and gathers no data. In the dashboard editor it always shows, so you can still find and edit it.
+
+In January it reviews the year that just ended.
+
+| Option | Default | What it does |
+| --- | --- | --- |
+| `show_from` | `"12-01"` | First day it shows, as `"MM-DD"` |
+| `show_until` | `"01-15"` | Last day it shows, as `"MM-DD"` |
+| `always_show` | `false` | `true` shows it all year |
+| `year` | the year being reviewed | Review a specific year instead |
 
 The card needs an **admin** user, because it reads the registries and recorder statistics over the websocket API.
 
